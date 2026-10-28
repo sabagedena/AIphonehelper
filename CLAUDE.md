@@ -123,6 +123,7 @@ MIN_STT_CONFIDENCE=0.65                # Deepgram confidence floor to discard ph
 BARGE_IN_MIN_CONFIDENCE=0.80           # Confidence a one-word transcript needs to interrupt the bot
 MIN_VOICE_RMS=600.0                    # Foreground voice threshold for spectral isolator
 MUTE_USER_WHILE_BOT_SPEAKS=false       # Barge-in control
+RECORD_CALLS=false                     # true: save each caller's audio to recordings/*.wav for gate tuning
 ```
 
 ---

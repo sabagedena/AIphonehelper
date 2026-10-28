@@ -16,6 +16,7 @@ import sys
 import threading
 import time
 import uuid
+import wave
 from typing import Callable, Dict, Optional, Tuple
 
 import requests
@@ -67,6 +68,10 @@ FRAME_BYTES_PCM16 = FRAME_SAMPLES * 2  # 320 bytes (16-bit signed mono)
 SILENCE_PCM16 = b"\x00" * FRAME_BYTES_PCM16
 
 _GREETING_PCM16_CACHE: Optional[bytes] = None
+
+# RECORD_CALLS=true saves what the pipeline hears from each caller to recordings/*.wav, for tuning
+# the speech gate on real calls. Off by default: it records callers' voices.
+RECORD_CALLS = os.getenv("RECORD_CALLS", "false").strip().lower() == "true"
 
 
 def warm_greeting_cache() -> Optional[bytes]:
@@ -414,6 +419,7 @@ class PhoneCall:
         self.acked = False
         self.active = True
         self.started_at = time.monotonic()
+        self.recorded_pcm: Optional[bytearray] = bytearray() if RECORD_CALLS else None
 
     def hangup(self):
         if not self.active:
@@ -438,6 +444,8 @@ class VoIPAudioInput(BaseInputTransport):
         def _on_rtp_pcm(pcm16: bytes):
             if not self._call.active:
                 return
+            if self._call.recorded_pcm is not None:
+                self._call.recorded_pcm.extend(pcm16)
             audio_frame = InputAudioRawFrame(
                 audio=pcm16,
                 sample_rate=PHONE_SAMPLE_RATE,
@@ -532,6 +540,17 @@ class BotDisplay(FrameProcessor):
             print("✋ [შეწყვეტილია]")
             self._buf = []
         await self.push_frame(frame, direction)
+
+
+def save_recording(call: PhoneCall):
+    os.makedirs("recordings", exist_ok=True)
+    path = os.path.join("recordings", f"call-{time.strftime('%Y%m%d-%H%M%S')}.wav")
+    with wave.open(path, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(PHONE_SAMPLE_RATE)
+        wav.writeframes(bytes(call.recorded_pcm))
+    print(f"💾 ზარის ჩანაწერი: {path}")
 
 
 async def handle_call_session(call: PhoneCall):
@@ -644,6 +663,8 @@ async def handle_call_session(call: PhoneCall):
         # Sends BYE only if the caller hasn't already hung up, so the line never stays open on dead air
         call.hangup()
         call.sip_server.calls.pop(call.call_id, None)
+        if call.recorded_pcm:
+            save_recording(call)
         for t in (greet_task, monitor_task):
             if not t.done():
                 t.cancel()

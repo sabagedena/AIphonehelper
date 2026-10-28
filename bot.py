@@ -53,6 +53,30 @@ _model_cooldown_until: dict[str, float] = {}
 _RETRY_DELAY_RE = re.compile(r"retryDelay['\"]?:\s*['\"]?(\d+(?:\.\d+)?)s")
 _DEFAULT_QUOTA_COOLDOWN_SECS = 60.0
 _MAX_QUOTA_COOLDOWN_SECS = 3600.0
+# Gemini streams a short reply in well under a second between chunks; a gap this long is a stall
+_MID_STREAM_IDLE_SECS = 4.0
+
+
+def _chunk_has_content(chunk: GenerateContentResponse) -> bool:
+    """True if the chunk carries spoken text or a function call (not just usage or thoughts)."""
+    for candidate in chunk.candidates or []:
+        for part in (candidate.content.parts if candidate.content else None) or []:
+            if (part.text and not part.thought) or part.function_call:
+                return True
+    return False
+
+
+async def _read_until_content(aiter) -> list[GenerateContentResponse]:
+    """Reads stream chunks up to and including the first one with content."""
+    chunks = []
+    while True:
+        try:
+            chunk = await aiter.__anext__()
+        except StopAsyncIteration:
+            raise RuntimeError("Gemini returned an empty response") from None
+        chunks.append(chunk)
+        if _chunk_has_content(chunk):
+            return chunks
 
 
 class FastGoogleLLMService(GoogleLLMService):
@@ -134,10 +158,11 @@ class FastGoogleLLMService(GoogleLLMService):
         )
         aiter = raw_stream.__aiter__()
         try:
-            first_chunk = await asyncio.wait_for(
-                aiter.__anext__(), timeout=5.0
-            )
-            return model_name, first_chunk, aiter, raw_stream
+            # Only a chunk with something to say makes this request the winner. Gemini can open with
+            # usage-only or thought-only chunks and then stall or end; declaring those the winner
+            # stopped the hedge and left a live caller in silence.
+            leading_chunks = await asyncio.wait_for(_read_until_content(aiter), timeout=5.0)
+            return model_name, leading_chunks, aiter, raw_stream
         except Exception:
             aclose = getattr(raw_stream, "aclose", None)
             if aclose is not None:
@@ -230,16 +255,19 @@ class FastGoogleLLMService(GoogleLLMService):
                 asyncio.create_task(self._cancel_losing_tasks(list(active_tasks)))
                 active_tasks.clear()
 
-            win_model, first_chunk, aiter, raw_stream = winner
+            win_model, leading_chunks, aiter, raw_stream = winner
             logger.debug(f"Gemini winner model: {win_model}")
             try:
-                yield first_chunk
+                for chunk in leading_chunks:
+                    yield chunk
                 while True:
                     try:
-                        chunk = await asyncio.wait_for(
-                            aiter.__anext__(), timeout=self._stream_idle_timeout_secs
-                        )
+                        chunk = await asyncio.wait_for(aiter.__anext__(), timeout=_MID_STREAM_IDLE_SECS)
                     except StopAsyncIteration:
+                        break
+                    except asyncio.TimeoutError:
+                        # Speak what already arrived rather than keep the caller waiting
+                        logger.warning(f"Gemini stream stalled for {_MID_STREAM_IDLE_SECS:.0f}s; ending reply early")
                         break
                     yield chunk
             finally:

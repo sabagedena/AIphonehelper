@@ -21,3 +21,6 @@ voice_samples/
 .vscode/
 .idea/
 *.log
+
+# Call recordings (RECORD_CALLS=true)
+recordings/

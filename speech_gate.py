@@ -63,6 +63,11 @@ from pipecat.turns.user_turn_strategies import UserTurnStrategies
 MIN_STT_CONFIDENCE = float(os.getenv("MIN_STT_CONFIDENCE", "0.65"))
 # Minimum foreground voice-band RMS (int16 scale) required to open the voice isolator gate.
 MIN_VOICE_RMS = float(os.getenv("MIN_VOICE_RMS", "600.0"))
+# Starting estimate of the caller's close-talk voice level (int16 voice-band RMS), and caps on how far
+# a loud caller can raise the onset / sustain bar above MIN_VOICE_RMS
+_DEFAULT_FOREGROUND_RMS = 1800.0
+_MAX_FOREGROUND_ONSET_RMS = 750.0
+_MAX_FOREGROUND_SUSTAIN_RMS = 400.0
 # A one-word transcript may interrupt the speaking bot only above this Deepgram confidence.
 BARGE_IN_MIN_CONFIDENCE = float(os.getenv("BARGE_IN_MIN_CONFIDENCE", "0.80"))
 # How long after VAD says "stopped" we still accept late STT finals.
@@ -144,7 +149,7 @@ class RealtimeVoiceIsolator:
         # only on harmonic (voice-like) hops: it exists to out-shout TV and distant talkers, and a door
         # knock or clap (broadband, a few hops) must not raise the bar for the caller's next words.
         self.recent_voice_rms: list[float] = []
-        self.foreground_voice_rms = 1800.0
+        self.foreground_voice_rms = _DEFAULT_FOREGROUND_RMS
         self.calibration_hops = 0
         self.active_streak = 0
         self.hangover_hops = 0
@@ -216,14 +221,15 @@ class RealtimeVoiceIsolator:
                 # Distant TV or talkers have speech-like spectra, so a new onset must also clearly
                 # beat the loudest recent background, not just its average level
                 self.background_peak_rms * 2.0,
-                self.foreground_voice_rms * (0.42 if in_bot_echo_guard else 0.30),
+                # Capped: a caller who spoke loudly once must still be heard when they answer softly
+                min(self.foreground_voice_rms * (0.42 if in_bot_echo_guard else 0.30), _MAX_FOREGROUND_ONSET_RMS),
             )
             sustain_thresh = max(
                 self.min_voice_rms * 0.55,
                 self.noise_floor_rms * 1.8,
                 # A knock or clap can open the gate over a playing TV; don't let the TV hold it open
                 self.background_peak_rms * 0.8,
-                self.foreground_voice_rms * 0.16,
+                min(self.foreground_voice_rms * 0.16, _MAX_FOREGROUND_SUSTAIN_RMS),
             )
 
             thresh = sustain_thresh if self.is_foreground_active else onset_thresh
@@ -253,6 +259,10 @@ class RealtimeVoiceIsolator:
                     self.hangover_hops -= 1
                 else:
                     self.is_foreground_active = False
+                    # The level above only ever rose toward loud peaks, so one loud sentence made every
+                    # quieter answer look like distant background. Ease back to the default (~6 s).
+                    if self.foreground_voice_rms > _DEFAULT_FOREGROUND_RMS:
+                        self.foreground_voice_rms = max(_DEFAULT_FOREGROUND_RMS, self.foreground_voice_rms * 0.998)
 
                 # Update background noise profile when foreground user is not speaking (and bot isn't speaking).
                 # Falls fast but rises at most ~1.5% per hop, so a word the detector hasn't confirmed yet
