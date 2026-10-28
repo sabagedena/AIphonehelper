@@ -1,4 +1,5 @@
 import asyncio
+from contextlib import aclosing
 import io
 import re
 import time
@@ -51,8 +52,24 @@ _GEORGIAN_VIGESIMAL = {
     80: ("ოთხმოცი", "ოთხმოცდა"),
 }
 
+_GEORGIAN_SCALES = (
+    (1_000_000_000, "მილიარდი"),
+    (1_000_000, "მილიონი"),
+    (1000, "ათასი"),
+)
+
 def number_to_georgian(n: int) -> str:
-    """Converts integers (0-9999) into natural Georgian words."""
+    """Converts integers (0 - 999,999,999,999) into natural Georgian words."""
+    if n >= 1_000_000_000_000:
+        return str(n)
+    for scale, name in _GEORGIAN_SCALES:
+        if n >= scale:
+            count, rem = divmod(n, scale)
+            head = name if count == 1 else number_to_georgian(count) + " " + name
+            if rem == 0:
+                return head
+            # The scale word drops its final 'ი' before a remainder: 'ორი ათას ოცდაექვსი'
+            return head[:-1] + " " + number_to_georgian(rem)
     if n in _GEORGIAN_UNITS:
         return _GEORGIAN_UNITS[n]
     if n < 100:
@@ -69,34 +86,18 @@ def number_to_georgian(n: int) -> str:
             return h_str
         prefix = "ას " if h == 1 else (_GEORGIAN_UNITS[h][:-1] if _GEORGIAN_UNITS[h].endswith("ი") else _GEORGIAN_UNITS[h]) + "ას "
         return prefix + number_to_georgian(rem)
-    if n < 10000:
-        th = n // 1000
-        rem = n % 1000
-        th_str = "ათასი" if th == 1 else number_to_georgian(th) + " ათასი"
-        if rem == 0:
-            return th_str
-        return th_str + " " + number_to_georgian(rem)
-    return str(n)
 
+# Matched case-insensitively, so 'Sms', 'Pin', 'WHATSAPP' are caught too
 _LATIN_TO_GEORGIAN_PHONETICS = {
     r"\bPIN\b": "პინ",
-    r"\bpin\b": "პინ",
     r"\bSMS\b": "ესემეს",
-    r"\bsms\b": "ესემეს",
     r"\bWi-?Fi\b": "ვაიფაი",
-    r"\bwifi\b": "ვაიფაი",
     r"\bWhatsApp\b": "ვაცაპი",
-    r"\bwhatsapp\b": "ვაცაპი",
     r"\bViber\b": "ვაიბერი",
-    r"\bviber\b": "ვაიბერი",
     r"\bFacebook\b": "ფეისბუქი",
-    r"\bfacebook\b": "ფეისბუქი",
     r"\bGoogle\b": "გუგლი",
-    r"\bgoogle\b": "გუგლი",
     r"\bYouTube\b": "იუთუბი",
-    r"\byoutube\b": "იუთუბი",
     r"\bSIM\b": "სიმ",
-    r"\bsim\b": "სიმ",
     r"₾": " ლარი",
     r"\$": " დოლარი",
     r"%": " პროცენტი",
@@ -107,12 +108,12 @@ def normalize_georgian_text(text: str) -> str:
     Normalizes text for natural, native Georgian neural TTS:
     - Replaces English/Latin tech terms with natural Georgian phonetics.
     - Converts digits with Georgian suffixes (e.g., '112-ზე' -> 'ას თორმეტზე').
-    - Converts numbers (0-9999) to full Georgian words.
+    - Converts numbers (up to hundreds of billions) to full Georgian words.
     - Expands currency and percentage symbols.
     """
     # 1. Expand Latin tech keywords to Georgian phonetic equivalents
     for pattern, replacement in _LATIN_TO_GEORGIAN_PHONETICS.items():
-        text = re.sub(pattern, replacement, text)
+        text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
 
     # 2. Convert hyphenated number-suffix combinations (e.g. 112-ზე, 5-ში, 25-ს)
     def replace_num_suffix(m):
@@ -319,6 +320,7 @@ class EdgeTTSService(TTSService):
                 ssml = mkssml(self._tts_config, escaped_segment)
                 req = ssml_headers_plus_data(connect_id(), date_to_string(), ssml)
                 audio_received = False
+                turn_ended = False
                 try:
                     await ws.send_str(req)
                     async for received in ws:
@@ -339,6 +341,7 @@ class EdgeTTSService(TTSService):
                             if sep != -1:
                                 parameters, _ = get_headers_and_data(encoded, sep)
                                 if parameters.get(b"Path") == b"turn.end":
+                                    turn_ended = True
                                     break
                         elif received.type in (
                             aiohttp.WSMsgType.CLOSE,
@@ -355,6 +358,25 @@ class EdgeTTSService(TTSService):
                     if attempt == 1 or audio_received:
                         raise e
                     logger.debug(f"EdgeTTS warm socket retry after: {e}")
+                finally:
+                    # Abandoned mid-turn (barge-in cancellation or generator closed): the socket still
+                    # holds unread audio for this request and would replay it on the next reply.
+                    if not turn_ended and self._ws is ws:
+                        self._ws = None
+                        self._discard_ws(ws)
+
+    @staticmethod
+    def _discard_ws(ws: aiohttp.ClientWebSocketResponse):
+        async def _close():
+            try:
+                await ws.close()
+            except Exception:
+                pass
+
+        try:
+            asyncio.get_running_loop().create_task(_close())
+        except RuntimeError:
+            pass
 
     async def run_tts(self, text: str, context_id: str) -> AsyncGenerator[Frame, None]:
         if not text or not text.strip():
@@ -385,55 +407,57 @@ class EdgeTTSService(TTSService):
                 resampler: Optional[soxr.ResampleStream] = None
                 pcm_Carry = bytearray()
 
-                async for mp3_chunk in self._stream_mp3_chunks(seg):
-                    mp3_buffer.extend(mp3_chunk)
-                    if len(mp3_buffer) >= next_decode_threshold:
-                        next_decode_threshold = len(mp3_buffer) + self._STEP_DECODE_BYTES
-                        try:
-                            audio_data, source_sr = sf.read(io.BytesIO(mp3_buffer), dtype="int16")
-                        except Exception:
-                            continue
-
-                        safe_end = len(audio_data) - self._MP3_TAIL_GUARD_SAMPLES
-                        if not leading_silence_trimmed and safe_end > 0:
-                            active_idx = np.flatnonzero(np.abs(audio_data[:safe_end]) > 80)
-                            if len(active_idx) > 0:
-                                lead_guard = int(source_sr * 0.015)  # keep 15ms soft lead-in
-                                emitted_source_samples = max(0, int(active_idx[0]) - lead_guard)
-                                leading_silence_trimmed = True
-                            else:
-                                # Still pure leading silence; wait for next chunk
-                                emitted_source_samples = safe_end
+                # aclosing() releases the socket lock as soon as this reply is interrupted
+                async with aclosing(self._stream_mp3_chunks(seg)) as mp3_stream:
+                    async for mp3_chunk in mp3_stream:
+                        mp3_buffer.extend(mp3_chunk)
+                        if len(mp3_buffer) >= next_decode_threshold:
+                            next_decode_threshold = len(mp3_buffer) + self._STEP_DECODE_BYTES
+                            try:
+                                audio_data, source_sr = sf.read(io.BytesIO(mp3_buffer), dtype="int16")
+                            except Exception:
                                 continue
 
-                        if safe_end > emitted_source_samples:
-                            new_samples = audio_data[emitted_source_samples:safe_end]
-                            emitted_source_samples = safe_end
-                            if source_sr != self._target_sample_rate:
-                                if resampler is None:
-                                    resampler = soxr.ResampleStream(
-                                        source_sr, self._target_sample_rate, 1, dtype="int16"
-                                    )
-                                resampled = resampler.resample_chunk(new_samples, last=False)
-                            else:
-                                resampled = new_samples
+                            safe_end = len(audio_data) - self._MP3_TAIL_GUARD_SAMPLES
+                            if not leading_silence_trimmed and safe_end > 0:
+                                active_idx = np.flatnonzero(np.abs(audio_data[:safe_end]) > 80)
+                                if len(active_idx) > 0:
+                                    lead_guard = int(source_sr * 0.015)  # keep 15ms soft lead-in
+                                    emitted_source_samples = max(0, int(active_idx[0]) - lead_guard)
+                                    leading_silence_trimmed = True
+                                else:
+                                    # Still pure leading silence; wait for next chunk
+                                    emitted_source_samples = safe_end
+                                    continue
 
-                            pcm_Carry.extend(resampled.tobytes())
-                            while len(pcm_Carry) >= chunk_size:
-                                out_chunk = bytes(pcm_Carry[:chunk_size])
-                                del pcm_Carry[:chunk_size]
-                                if not ttfb_stopped:
-                                    await self.stop_ttfb_metrics()
-                                    ttfb_stopped = True
-                                    logger.debug(
-                                        f"EdgeTTS first audio in {time.monotonic() - t0:.2f}s for: {text[:35]}..."
+                            if safe_end > emitted_source_samples:
+                                new_samples = audio_data[emitted_source_samples:safe_end]
+                                emitted_source_samples = safe_end
+                                if source_sr != self._target_sample_rate:
+                                    if resampler is None:
+                                        resampler = soxr.ResampleStream(
+                                            source_sr, self._target_sample_rate, 1, dtype="int16"
+                                        )
+                                    resampled = resampler.resample_chunk(new_samples, last=False)
+                                else:
+                                    resampled = new_samples
+
+                                pcm_Carry.extend(resampled.tobytes())
+                                while len(pcm_Carry) >= chunk_size:
+                                    out_chunk = bytes(pcm_Carry[:chunk_size])
+                                    del pcm_Carry[:chunk_size]
+                                    if not ttfb_stopped:
+                                        await self.stop_ttfb_metrics()
+                                        ttfb_stopped = True
+                                        logger.debug(
+                                            f"EdgeTTS first audio in {time.monotonic() - t0:.2f}s for: {text[:35]}..."
+                                        )
+                                    yield TTSAudioRawFrame(
+                                        audio=out_chunk,
+                                        sample_rate=self._target_sample_rate,
+                                        num_channels=1,
+                                        context_id=context_id,
                                     )
-                                yield TTSAudioRawFrame(
-                                    audio=out_chunk,
-                                    sample_rate=self._target_sample_rate,
-                                    num_channels=1,
-                                    context_id=context_id,
-                                )
 
                 if not mp3_buffer:
                     continue

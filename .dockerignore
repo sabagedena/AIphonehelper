@@ -1,0 +1,19 @@
+# Secrets must never be baked into an image layer
+.env
+
+# Local Windows virtualenv and caches
+.venv/
+venv/
+ENV/
+__pycache__/
+*.py[cod]
+
+# Repo metadata, editor files, audio samples
+.git/
+.vscode/
+.idea/
+*.log
+*.wav
+*.mp3
+test_samples/
+voice_samples/

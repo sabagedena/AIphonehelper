@@ -111,8 +111,8 @@ def warm_greeting_cache() -> Optional[bytes]:
 # Enable UTF-8 console output on Windows so Georgian script & emojis never raise UnicodeEncodeError
 if hasattr(sys.stdout, "reconfigure"):
     try:
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True, write_through=True)
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace", line_buffering=True, write_through=True)
     except Exception:
         pass
 
@@ -219,6 +219,8 @@ class RTPSession:
 
         self.last_rx_time = time.monotonic()
         self.last_tx_speech_time = 0.0
+        self.barge_in_streak = 0
+        self.barge_in_until = 0.0
         self.rx_packets = 0
         self.tx_packets = 0
         self._audio_callback: Optional[Callable[[bytes], None]] = None
@@ -365,13 +367,22 @@ class RTPSession:
             else:
                 in_chunk = SILENCE_PCM16
 
-            # Echo guard while AI is actively speaking (+ 180ms hybrid echo decay tail):
-            # Filters out quiet PSTN/mobile hybrid echo so the bot never interrupts itself,
-            # while still letting loud human barge-in speech pass through.
-            if (time.monotonic() - self.last_tx_speech_time) < 0.18 and in_chunk != SILENCE_PCM16:
+            # Echo & background noise guard while AI is actively speaking (+ 220ms hybrid echo decay tail):
+            # Requires 3 consecutive 20ms frames (60ms) of strong foreground speech before opening barge-in,
+            # so background noise spikes or PSTN hybrid echo never interrupt the AI mid-sentence.
+            now_mono = time.monotonic()
+            if (now_mono - self.last_tx_speech_time) < 0.22 and in_chunk != SILENCE_PCM16:
                 rms = audioop.rms(in_chunk, 2)
-                if rms < self.barge_in_rms_threshold:
+                if rms >= self.barge_in_rms_threshold:
+                    self.barge_in_streak += 1
+                    if self.barge_in_streak >= 3:
+                        self.barge_in_until = now_mono + 0.45
+                else:
+                    self.barge_in_streak = 0
+                if now_mono > self.barge_in_until:
                     in_chunk = SILENCE_PCM16
+            else:
+                self.barge_in_streak = 0
 
             if self._audio_callback is not None:
                 try:
@@ -539,7 +550,7 @@ async def handle_call_session(call: PhoneCall):
     )
     transport = VoIPTransport(call, transport_params)
 
-    vad = build_vad_processor(stop_secs=0.2)
+    vad = build_vad_processor()
     stt = DeepgramSTTService(
         api_key=os.getenv("DEEPGRAM_API_KEY"),
         settings=DeepgramSTTService.Settings(
@@ -555,7 +566,7 @@ async def handle_call_session(call: PhoneCall):
     context = LLMContext()
     context_aggregator = LLMContextAggregatorPair(
         context,
-        user_params=build_user_params(user_speech_timeout=0.35),
+        user_params=build_user_params(user_speech_timeout=0.15),
     )
 
     pipeline = Pipeline(
@@ -592,10 +603,15 @@ async def handle_call_session(call: PhoneCall):
             return
         print("\n🤖 დამხმარე: " + INITIAL_GREETING)
         if _GREETING_PCM16_CACHE:
+            # Cached audio bypasses the pipeline, so record the greeting in the LLM context
+            # ourselves; otherwise the model doesn't know it already said „გამარჯობა“.
+            context.add_message({"role": "assistant", "content": INITIAL_GREETING})
             print("\n🤖 [დამხმარე საუბრობს...]")
+            vad._isolator.set_bot_speaking(True)
             call.rtp.enqueue_audio(_GREETING_PCM16_CACHE)
             while call.active and call.rtp.buffered_output_secs() > 0.05:
                 await asyncio.sleep(0.05)
+            vad._isolator.set_bot_speaking(False)
             if call.active:
                 print("👂 [გისმენთ... შეგიძლიათ ისაუბროთ]")
         else:
@@ -609,7 +625,7 @@ async def handle_call_session(call: PhoneCall):
             # Timeout if RTP stream stops completely for >35s
             if time.monotonic() - call.rtp.last_rx_time > 35.0:
                 logger.info("RTP inactivity timeout reached; ending call.")
-                call.active = False
+                call.hangup()
                 break
         print("\n📴 ზარი დასრულდა. (Call hung up)")
         call.rtp.stop()
@@ -624,8 +640,9 @@ async def handle_call_session(call: PhoneCall):
     except Exception as e:
         logger.error(f"Error during phone call session: {e}")
     finally:
-        call.active = False
-        call.rtp.stop()
+        # Sends BYE only if the caller hasn't already hung up, so the line never stays open on dead air
+        call.hangup()
+        call.sip_server.calls.pop(call.call_id, None)
         for t in (greet_task, monitor_task):
             if not t.done():
                 t.cancel()
@@ -647,6 +664,11 @@ class MyPhoneSIPServer:
     ):
         self.server = server
         self.port = port
+        # Only the provider's PBX may send us SIP; anything else is a scanner or spoofed INVITE
+        try:
+            self.server_ip = socket.gethostbyname(server)
+        except OSError:
+            self.server_ip = server
         self.username = username
         self.password = password
         self.local_ip = local_ip
@@ -655,18 +677,25 @@ class MyPhoneSIPServer:
         self.on_call = on_call
 
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             self.sock.bind((self.local_ip, self.sip_port))
         except OSError:
-            # If 5060 is held by another local app, pick a free port >= 5064
-            for candidate in range(5064, 5100, 2):
-                try:
-                    self.sock.bind((self.local_ip, candidate))
-                    self.sip_port = candidate
-                    break
-                except OSError:
-                    continue
+            # Ask any previous server_phone.py instance holding 5060 to release it
+            try:
+                tmp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                tmp.sendto(b"GEORGIAN_AI_TAKEOVER", (self.local_ip, self.sip_port))
+                tmp.close()
+                time.sleep(0.35)
+                self.sock.bind((self.local_ip, self.sip_port))
+            except OSError:
+                # If 5060 is still held by another app, pick a free port >= 5064
+                for candidate in range(5064, 5100, 2):
+                    try:
+                        self.sock.bind((self.local_ip, candidate))
+                        self.sip_port = candidate
+                        break
+                    except OSError:
+                        continue
         self.sock.settimeout(0.5)
 
         self.running = False
@@ -1000,6 +1029,19 @@ class MyPhoneSIPServer:
             if not data or data.strip() == b"":
                 continue
 
+            if data == b"GEORGIAN_AI_TAKEOVER" and addr[0] in (self.local_ip, "127.0.0.1"):
+                print("\n🔄 ახალი სერვერი ჩაირთო — ძველი სესია თავისუფლდება...")
+                self.running = False
+                try:
+                    self.sock.close()
+                except Exception:
+                    pass
+                os._exit(0)
+
+            if addr[0] != self.server_ip:
+                logger.debug(f"Ignoring SIP packet from unknown source {addr[0]}:{addr[1]}")
+                continue
+
             msg = data.decode("utf-8", errors="replace")
             first_line = msg.split("\r\n", 1)[0].strip()
 
@@ -1051,9 +1093,11 @@ def on_incoming_call(call: PhoneCall):
 def main():
     server = os.getenv("MYPHONE_SIP_SERVER", "89.150.1.11").strip()
     port = int(os.getenv("MYPHONE_SIP_PORT", "5060"))
-    user = os.getenv("MYPHONE_SIP_USERNAME", "1055986e0").strip()
-    pwd = os.getenv("MYPHONE_SIP_PASSWORD", "63gkxnhy").strip()
+    user = os.getenv("MYPHONE_SIP_USERNAME", "").strip()
+    pwd = os.getenv("MYPHONE_SIP_PASSWORD", "").strip()
     phone_num = os.getenv("MYPHONE_PHONE_NUMBER", "+995322195820").strip()
+    if not user or not pwd:
+        sys.exit("MYPHONE_SIP_USERNAME and MYPHONE_SIP_PASSWORD must be set in .env")
 
     local_ip = get_local_ip(server, port)
     public_ip = get_public_ip() or local_ip
@@ -1084,7 +1128,9 @@ def main():
     )
     sip_server.start()
 
+    announced_reg = False
     if sip_server.registered.wait(timeout=8.0):
+        announced_reg = True
         print(f"  ✅ წარმატებით დარეგისტრირდა! (REGISTERED on UDP port {sip_server.sip_port})")
         print("  ✅ Asterisk OPTIONS keepalive & Symmetric RTP NAT active!")
         print(f"\n👉 ახლა აიღეთ მობილური და დარეკეთ ნომერზე: {phone_num} (ან 032 2195820)")
@@ -1094,7 +1140,13 @@ def main():
 
     try:
         while True:
-            time.sleep(1.0)
+            if not announced_reg and sip_server.registered.is_set():
+                announced_reg = True
+                print(f"  ✅ წარმატებით დარეგისტრირდა! (REGISTERED on UDP port {sip_server.sip_port})")
+                print("  ✅ Asterisk OPTIONS keepalive & Symmetric RTP NAT active!")
+                print(f"\n👉 ახლა აიღეთ მობილური და დარეკეთ ნომერზე: {phone_num} (ან 032 2195820)")
+                print("   ხელოვნური ინტელექტი გიპასუხებთ ქართულად!\n")
+            time.sleep(0.5)
     except KeyboardInterrupt:
         print("\nსერვერი გაითიშა...")
     finally:

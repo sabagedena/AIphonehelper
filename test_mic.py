@@ -182,8 +182,8 @@ async def main():
         )
     )
 
-    # 0. Voice detection BEFORE STT, so we know when a real human is talking
-    vad = build_vad_processor(stop_secs=0.2)
+    # 0. Voice isolation & detection BEFORE STT, so only the foreground user's voice is heard
+    vad = build_vad_processor()
 
     # 1. Listen (Deepgram Georgian)
     stt = DeepgramSTTService(
@@ -208,7 +208,7 @@ async def main():
     context = LLMContext()
     context_aggregator = LLMContextAggregatorPair(
         context,
-        user_params=build_user_params(user_speech_timeout=0.18),
+        user_params=build_user_params(user_speech_timeout=0.15),
     )
 
     pipeline = Pipeline(

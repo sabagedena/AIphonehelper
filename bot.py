@@ -1,27 +1,20 @@
 import asyncio
-from contextlib import aclosing
 import os
 from typing import Any, AsyncIterator, cast
 
 from dotenv import load_dotenv
-from google.genai.types import GenerateContentConfig, GenerateContentResponse, ThinkingConfig
+from google.genai.types import GenerateContentConfig, GenerateContentResponse
 from loguru import logger
 
-from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.audio.vad.vad_analyzer import VADParams
-from pipecat.frames.frames import StartFrame, TTSSpeakFrame
+from pipecat.frames.frames import TTSSpeakFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.llm_context import LLMContext
-from pipecat.processors.aggregators.llm_response_universal import (
-    LLMContextAggregatorPair,
-    LLMUserAggregatorParams,
-)
+from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
 from pipecat.serializers.twilio import TwilioFrameSerializer
 from pipecat.services.anthropic.llm import AnthropicLLMService
 from pipecat.services.deepgram.stt import DeepgramSTTService
-from pipecat.services.elevenlabs.dialogue.tts import ElevenLabsDialogueTTSService
 from pipecat.services.google.llm import GoogleLLMService
 from pipecat.transports.websocket.fastapi import (
     FastAPIWebsocketParams,
@@ -37,11 +30,13 @@ load_dotenv()
 # Phone audio from Twilio is 8 kHz
 PHONE_SAMPLE_RATE = 8000
 
-# Fast Gemini model chain ordered by lowest latency -> highest availability fallback
+# Fast Gemini model chain ordered by lowest latency -> automatic retry on transient 503 spikes
 _GEMINI_FALLBACK_CHAIN = (
     "gemini-3-flash-preview",
     "gemini-3.1-flash-lite-preview",
-    "gemini-3.6-flash",
+    "gemini-3-flash-preview",
+    "gemini-3.1-flash-lite-preview",
+    "gemini-3-flash-preview",
 )
 
 
@@ -115,7 +110,7 @@ class FastGoogleLLMService(GoogleLLMService):
 
     async def _stream_response(self, context: LLMContext) -> AsyncIterator[GenerateContentResponse]:
         orig_model = self._settings.model or "gemini-3-flash-preview"
-        candidates = [orig_model] + [m for m in _GEMINI_FALLBACK_CHAIN if m != orig_model]
+        candidates = [orig_model] + list(_GEMINI_FALLBACK_CHAIN)
         self._log_llm_response(context)
 
         active_tasks: list[asyncio.Task] = []
@@ -309,7 +304,7 @@ async def run_bot(websocket, stream_sid: str, call_sid: str):
     # Conversation memory + fast turn-taking (~0.38s total silence detection).
     # VAD runs before STT and PhantomSpeechFilter drops transcripts Deepgram
     # invents from line noise/silence, so the bot never answers "nobody".
-    vad = build_vad_processor(stop_secs=0.2)
+    vad = build_vad_processor()
     phantom_filter = PhantomSpeechFilter()
     context = LLMContext()
     mute_strategies = (
@@ -320,7 +315,7 @@ async def run_bot(websocket, stream_sid: str, call_sid: str):
     context_aggregator = LLMContextAggregatorPair(
         context,
         user_params=build_user_params(
-            user_speech_timeout=0.2,
+            user_speech_timeout=0.15,
             mute_strategies=mute_strategies,
         ),
     )

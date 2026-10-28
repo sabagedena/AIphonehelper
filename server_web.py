@@ -141,13 +141,13 @@ async def browser_call_ws(websocket: WebSocket):
         rate=selected_rate,
     )
 
-    # VAD before STT + phantom filter: never answer transcripts Deepgram invents from silence
-    vad = build_vad_processor(stop_secs=0.2)
+    # VAD + Voice Isolator before STT + phantom filter: ignore background noise & silence hallucinations
+    vad = build_vad_processor()
     phantom_filter = PhantomSpeechFilter()
     context = LLMContext()
     context_aggregator = LLMContextAggregatorPair(
         context,
-        user_params=build_user_params(user_speech_timeout=0.18),
+        user_params=build_user_params(user_speech_timeout=0.15),
     )
 
     pipeline = Pipeline(
