@@ -49,7 +49,8 @@ This project is a **real-time, sub-second latency conversational Voice AI assist
      │
      ▼
 [LLM Engine] (bot.py)
-  • FastGoogleLLMService (hedges requests across Gemini models, 2.6s hedge delay)
+  • FastGoogleLLMService (one hedge request after 1.0s, a keep-warm connection; models that
+    return 429 quota errors are skipped until their retry delay passes)
   • OR AnthropicLLMService (Claude Haiku 4.5 with prompt caching)
   • System prompt: GEORGIAN_PROMPT (prompts.py)
      │
@@ -97,7 +98,7 @@ DEEPGRAM_MODEL=nova-3
 # --- LLM Brain (Gemini or Anthropic) ---
 LLM_PROVIDER=gemini                    # 'gemini' or 'anthropic'
 GOOGLE_API_KEY=your_google_key
-GEMINI_MODEL=gemini-3.1-flash-lite     # or gemini-3-flash-preview
+GEMINI_MODEL=gemini-flash-lite-latest  # ~1s first token on free tier; gemini-3-flash-preview free tier is 20 req/day
 
 # Anthropic (Optional)
 # LLM_PROVIDER=anthropic
@@ -119,6 +120,7 @@ MYPHONE_PHONE_NUMBER=+995322195820     # Direct incoming number: 032 219 58 20
 
 # --- Audio & Gate Tuning ---
 MIN_STT_CONFIDENCE=0.65                # Deepgram confidence floor to discard phantom noise
+BARGE_IN_MIN_CONFIDENCE=0.80           # Confidence a one-word transcript needs to interrupt the bot
 MIN_VOICE_RMS=600.0                    # Foreground voice threshold for spectral isolator
 MUTE_USER_WHILE_BOT_SPEAKS=false       # Barge-in control
 ```
@@ -199,6 +201,8 @@ Edge TTS requires pure Georgian characters (Mkedruli) to avoid unnatural robotic
 - Background hiss, telephone line noise, or distant TV chatter can cause Deepgram Nova-3 to output hallucinated Georgian phrases when silence is fed.
 - `SpeechOnlyAudioGate` buffers 0.35s before voice starts and cuts off audio transmission when VAD stops.
 - Transcripts with confidence score < `MIN_STT_CONFIDENCE` (0.65) are discarded by `PhantomSpeechFilter`.
+- `NoiseSafeUserTurnStartStrategy` starts the user turn on VAD only while the bot is idle. While the bot is thinking or speaking, only recognized words may interrupt it (two interim words, or a final transcript; a one-word final needs `BARGE_IN_MIN_CONFIDENCE`, default 0.80). Without this, any noise that passes VAD cuts the bot off and pipecat asks the caller to repeat.
+- Audio that bypasses the pipeline (the cached phone greeting) must be wrapped in `BotStartedSpeakingFrame` / `BotStoppedSpeakingFrame` so the turn strategy and echo guard know the bot is speaking.
 - If modifying audio logic, never send raw continuous non-voice audio directly to Deepgram.
 
 ---

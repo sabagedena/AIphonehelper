@@ -103,6 +103,14 @@ _LATIN_TO_GEORGIAN_PHONETICS = {
     r"%": " პროცენტი",
 }
 
+# The LLM occasionally emits a Latin letter inside a Georgian word („შეVედით“); spell it in Mkhedruli
+_LATIN_LETTER_TO_GEORGIAN = str.maketrans(
+    "abgdevztiklmnoprsufqhjcxwy",
+    "აბგდევზთიკლმნოპრსუფქჰჯცხვი",
+)
+_LATIN_IN_GEORGIAN_WORD = re.compile(r"(?<=[ა-ჰ])[A-Za-z]+|[A-Za-z]+(?=[ა-ჰ])")
+
+
 def normalize_georgian_text(text: str) -> str:
     """
     Normalizes text for natural, native Georgian neural TTS:
@@ -114,6 +122,7 @@ def normalize_georgian_text(text: str) -> str:
     # 1. Expand Latin tech keywords to Georgian phonetic equivalents
     for pattern, replacement in _LATIN_TO_GEORGIAN_PHONETICS.items():
         text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+    text = _LATIN_IN_GEORGIAN_WORD.sub(lambda m: m.group(0).lower().translate(_LATIN_LETTER_TO_GEORGIAN), text)
 
     # 2. Convert hyphenated number-suffix combinations (e.g. 112-ზე, 5-ში, 25-ს)
     def replace_num_suffix(m):

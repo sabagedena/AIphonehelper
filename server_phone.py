@@ -606,14 +606,15 @@ async def handle_call_session(call: PhoneCall):
             # Cached audio bypasses the pipeline, so record the greeting in the LLM context
             # ourselves; otherwise the model doesn't know it already said „გამარჯობა“.
             context.add_message({"role": "assistant", "content": INITIAL_GREETING})
-            print("\n🤖 [დამხმარე საუბრობს...]")
+            # Tell the pipeline the bot is speaking, so line noise during the greeting can't
+            # interrupt it (and the echo guard in the voice isolator stays on)
             vad._isolator.set_bot_speaking(True)
+            await task.queue_frames([BotStartedSpeakingFrame()])
             call.rtp.enqueue_audio(_GREETING_PCM16_CACHE)
             while call.active and call.rtp.buffered_output_secs() > 0.05:
                 await asyncio.sleep(0.05)
             vad._isolator.set_bot_speaking(False)
-            if call.active:
-                print("👂 [გისმენთ... შეგიძლიათ ისაუბროთ]")
+            await task.queue_frames([BotStoppedSpeakingFrame()])
         else:
             await task.queue_frames([TTSSpeakFrame(INITIAL_GREETING)])
 
@@ -1111,7 +1112,7 @@ def main():
     print(f"  - Local IP:   {local_ip}")
     print(f"  - Public IP:  {public_ip}")
     print("  - Listening:  Deepgram Nova-3 (Georgian)")
-    print(f"  - Brain:      Google Gemini ({os.getenv('GEMINI_MODEL', 'gemini-3.1-flash-lite')})")
+    print(f"  - Brain:      Google Gemini ({os.getenv('GEMINI_MODEL', 'gemini-flash-lite-latest')})")
     print(f"  - Voice:      Microsoft Edge Neural ({os.getenv('EDGE_TTS_VOICE', 'ka-GE-EkaNeural')})")
     print("=" * 65)
     print("  🚀 სტატუსი: რეგისტრაცია და ხმის მომზადება... (Registering & warming voice...)")

@@ -1,5 +1,7 @@
 import asyncio
 import os
+import re
+import time
 from typing import Any, AsyncIterator, cast
 
 from dotenv import load_dotenv
@@ -30,26 +32,77 @@ load_dotenv()
 # Phone audio from Twilio is 8 kHz
 PHONE_SAMPLE_RATE = 8000
 
-# Fast Gemini model chain ordered by lowest latency -> automatic retry on transient 503 spikes
+# Default model: on the free tier (measured 2026-10-28) gemini-flash-lite-latest gave its first token
+# in ~1s (0.7-2.5s), while gemini-3.1-flash-lite-preview took 2-18s and gemini-3-flash-preview
+# allows only 20 requests/day.
+DEFAULT_GEMINI_MODEL = "gemini-flash-lite-latest"
+
+# Hedge / fallback chain, fastest first. Its latency spikes are per-request jitter, so the hedge
+# races a second request to the same fast model; slower models only replace failed requests.
 _GEMINI_FALLBACK_CHAIN = (
+    "gemini-flash-lite-latest",
     "gemini-3-flash-preview",
     "gemini-3.1-flash-lite-preview",
-    "gemini-3-flash-preview",
-    "gemini-3.1-flash-lite-preview",
-    "gemini-3-flash-preview",
+    "gemini-flash-lite-latest",
 )
+
+# Models that answered 429 (quota exhausted) are skipped until Google's retryDelay passes, re-probed
+# at least hourly. Free-tier daily quotas are tiny (gemini-3-flash: 20 requests/day), and trying a
+# dead model costs every turn an extra round trip.
+_model_cooldown_until: dict[str, float] = {}
+_RETRY_DELAY_RE = re.compile(r"retryDelay['\"]?:\s*['\"]?(\d+(?:\.\d+)?)s")
+_DEFAULT_QUOTA_COOLDOWN_SECS = 60.0
+_MAX_QUOTA_COOLDOWN_SECS = 3600.0
 
 
 class FastGoogleLLMService(GoogleLLMService):
     """Low-latency Gemini LLM service with parallel tail-latency hedging."""
 
-    _HEDGE_DELAY_SECS = 2.6
+    # A warm gemini-flash-lite-latest request usually returns its first token in 0.6-1.0s; when it
+    # hasn't by now, a second request mostly answers within 0.1-0.4s
+    _HEDGE_DELAY_SECS = 1.0
+
+    # The Gemini client's aiohttp connector drops idle connections after 15s, and on a call the gap
+    # between replies is usually longer, so each turn paid a fresh TLS handshake (~250ms+).
+    # A model-metadata GET keeps the connection open; it uses no generation quota.
+    _KEEPWARM_IDLE_SECS = 10.0
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+        self._last_request_at = 0.0
+        self._keepwarm_task: asyncio.Task | None = None
+
+    async def start(self, frame):
+        await super().start(frame)
+        if self._keepwarm_task is None:
+            self._keepwarm_task = self.create_task(self._keepwarm_loop(), "gemini_keepwarm")
+
+    async def stop(self, frame):
+        await self._stop_keepwarm()
+        await super().stop(frame)
+
+    async def cancel(self, frame):
+        await self._stop_keepwarm()
+        await super().cancel(frame)
+
+    async def _stop_keepwarm(self):
+        if self._keepwarm_task:
+            await self.cancel_task(self._keepwarm_task)
+            self._keepwarm_task = None
+
+    async def _keepwarm_loop(self):
+        while True:
+            if self._client and time.monotonic() - self._last_request_at >= self._KEEPWARM_IDLE_SECS:
+                self._last_request_at = time.monotonic()
+                try:
+                    await self._client.aio.models.get(model=self._settings.model or DEFAULT_GEMINI_MODEL)
+                except Exception as e:
+                    logger.debug(f"Gemini keep-warm note: {e}")
+            await asyncio.sleep(1.0)
 
     async def _open_model_stream(self, context: LLMContext, model_name: str):
         """Opens a streaming request for a specific model and awaits its first content chunk."""
+        self._last_request_at = time.monotonic()
         adapter = self.get_llm_adapter()
         params = await adapter.get_llm_invocation_params(
             context,
@@ -108,36 +161,53 @@ class FastGoogleLLMService(GoogleLLMService):
             except (asyncio.CancelledError, Exception):
                 pass
 
+    def _note_quota_error(self, model_name: str, err: Exception):
+        """Benches a model whose quota is exhausted, so later turns don't waste a round trip on it."""
+        if getattr(err, "code", None) != 429:
+            return
+        m = _RETRY_DELAY_RE.search(str(err))
+        delay = min(float(m.group(1)), _MAX_QUOTA_COOLDOWN_SECS) if m else _DEFAULT_QUOTA_COOLDOWN_SECS
+        _model_cooldown_until[model_name] = time.monotonic() + delay
+        logger.warning(f"Gemini '{model_name}' quota exhausted; skipping it for {delay:.0f}s")
+
     async def _stream_response(self, context: LLMContext) -> AsyncIterator[GenerateContentResponse]:
-        orig_model = self._settings.model or "gemini-3-flash-preview"
+        orig_model = self._settings.model or DEFAULT_GEMINI_MODEL
         candidates = [orig_model] + list(_GEMINI_FALLBACK_CHAIN)
+        now = time.monotonic()
+        available = [m for m in candidates if _model_cooldown_until.get(m, 0.0) <= now]
+        if available:
+            candidates = available
         self._log_llm_response(context)
 
-        active_tasks: list[asyncio.Task] = []
+        active_tasks: dict[asyncio.Task, str] = {}
         next_idx = 0
+        hedged = False
         last_err: Exception | None = None
         winner = None
 
         try:
             while next_idx < len(candidates) or active_tasks:
-                if next_idx < len(candidates):
+                # One request at a time, plus a single hedge once the first is slow; further
+                # candidates only replace failed requests, so a slow API can't multiply quota use.
+                if next_idx < len(candidates) and (not active_tasks or not hedged):
+                    if active_tasks:
+                        hedged = True
                     model_to_launch = candidates[next_idx]
                     next_idx += 1
                     if next_idx > 1:
                         logger.debug(f"Hedging LLM request with '{model_to_launch}'")
-                    active_tasks.append(
-                        asyncio.create_task(self._open_model_stream(context, model_to_launch))
-                    )
+                    task = asyncio.create_task(self._open_model_stream(context, model_to_launch))
+                    active_tasks[task] = model_to_launch
 
-                wait_timeout = self._HEDGE_DELAY_SECS if next_idx < len(candidates) else None
+                can_hedge = next_idx < len(candidates) and not hedged
                 done, _ = await asyncio.wait(
                     active_tasks,
-                    timeout=wait_timeout,
+                    timeout=self._HEDGE_DELAY_SECS if can_hedge else None,
                     return_when=asyncio.FIRST_COMPLETED,
                 )
 
                 for d in done:
-                    active_tasks.remove(d)
+                    model_name = active_tasks.pop(d)
                     try:
                         winner = d.result()
                         break
@@ -145,6 +215,7 @@ class FastGoogleLLMService(GoogleLLMService):
                         return
                     except Exception as e:
                         last_err = e
+                        self._note_quota_error(model_name, e)
                         logger.debug(f"Gemini candidate error ({type(e).__name__}): {e}")
 
                 if winner is not None:
@@ -201,7 +272,7 @@ def build_llm():
         )
 
     if provider == "gemini":
-        model = os.getenv("GEMINI_MODEL", "gemini-3-flash-preview").strip() or "gemini-3-flash-preview"
+        model = os.getenv("GEMINI_MODEL", DEFAULT_GEMINI_MODEL).strip() or DEFAULT_GEMINI_MODEL
         settings = dict(
             model=model,
             system_instruction=GEORGIAN_PROMPT,

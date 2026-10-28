@@ -16,9 +16,10 @@ The multi-layer solution implemented here:
          50/60 Hz mains hum, plosive thumps, and high-frequency hiss.
        - Adaptive per-bin Wiener spectral subtraction suppresses stationary background
          noise while preserving natural Georgian consonants.
-       - Dynamic Foreground Speaker Gate tracks both the ambient noise floor and the
-         foreground speaker's close-talk voice level, plus vocal formant concentration
-         (250–3000 Hz) and pitch-band harmonic crest (130–1000 Hz). Distant background
+       - Dynamic Foreground Speaker Gate tracks the ambient noise floor, the loudest recent
+         background (TV, distant talkers), and the foreground speaker's close-talk voice
+         level, plus speech-band concentration (120–3400 Hz) and pitch-band harmonic crest
+         (130–1000 Hz). Distant background
          voices/TV and ambient noise are replaced with pure digital silence (0), while
          a 3-hop (48 ms) lookahead and 256 ms hangover preserve every foreground word
          from its first consonant to its final release.
@@ -27,6 +28,9 @@ The multi-layer solution implemented here:
          with a 0.35s pre-roll and 0.24s clean trailing silence before STT finalize.
     3. ``PhantomSpeechFilter``:
        - Drops any low-confidence or noise-induced transcripts.
+    4. ``NoiseSafeUserTurnStartStrategy``:
+       - While the bot is thinking or speaking, only recognized words (not VAD alone)
+         may interrupt it, so a cough or a door slam never cuts the bot off.
 """
 
 import os
@@ -50,7 +54,8 @@ from pipecat.frames.frames import (
 from pipecat.processors.aggregators.llm_response_universal import LLMUserAggregatorParams
 from pipecat.processors.audio.vad_processor import VADProcessor
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
-from pipecat.turns.user_start import VADUserTurnStartStrategy
+from pipecat.turns.types import ProcessFrameResult
+from pipecat.turns.user_start import BaseUserTurnStartStrategy
 from pipecat.turns.user_stop import SpeechTimeoutUserTurnStopStrategy
 from pipecat.turns.user_turn_strategies import UserTurnStrategies
 
@@ -58,6 +63,8 @@ from pipecat.turns.user_turn_strategies import UserTurnStrategies
 MIN_STT_CONFIDENCE = float(os.getenv("MIN_STT_CONFIDENCE", "0.65"))
 # Minimum foreground voice-band RMS (int16 scale) required to open the voice isolator gate.
 MIN_VOICE_RMS = float(os.getenv("MIN_VOICE_RMS", "600.0"))
+# A one-word transcript may interrupt the speaking bot only above this Deepgram confidence.
+BARGE_IN_MIN_CONFIDENCE = float(os.getenv("BARGE_IN_MIN_CONFIDENCE", "0.80"))
 # How long after VAD says "stopped" we still accept late STT finals.
 TRANSCRIPT_GRACE_SECS = 2.0
 
@@ -110,8 +117,10 @@ class RealtimeVoiceIsolator:
         bp[freqs > hi_stop] = 0.02
         self.bandpass_mask = bp
 
-        # Core human vocal formant bins (250 Hz - 3000 Hz) & pitch harmonic band (130 Hz - 1000 Hz)
-        self.formant_bins = (freqs >= 250.0) & (freqs <= 3000.0)
+        # Speech band (120 Hz - 3400 Hz, fundamental through formants) & pitch harmonic band (130 Hz - 1000 Hz).
+        # The band must include the voice fundamental: vowels like 'ო'/'უ' carry most of their energy
+        # below 250 Hz, and a 250 Hz floor scored them as 5% speech and zeroed whole words.
+        self.formant_bins = (freqs >= 120.0) & (freqs <= 3400.0)
         self.pitch_bins = (freqs >= 130.0) & (freqs <= 1000.0)
         self.voice_bins = (freqs >= 140.0) & (freqs <= 3400.0)
 
@@ -129,6 +138,12 @@ class RealtimeVoiceIsolator:
 
         # Adaptive level trackers (in time-domain int16 RMS units)
         self.noise_floor_rms = 200.0
+        # Recent loudest background (TV, other talkers): fast attack, ~3.7s half-life decay
+        self.background_peak_rms = 0.0
+        # Voice-band RMS of the last 3 hops (48 ms). The background tracker follows their median, and
+        # only on harmonic (voice-like) hops: it exists to out-shout TV and distant talkers, and a door
+        # knock or clap (broadband, a few hops) must not raise the bar for the caller's next words.
+        self.recent_voice_rms: list[float] = []
         self.foreground_voice_rms = 1800.0
         self.calibration_hops = 0
         self.active_streak = 0
@@ -173,6 +188,9 @@ class RealtimeVoiceIsolator:
 
             # Exact Parseval voice-band RMS in int16 scale (compensating for sqrt-Hann 0.5 window power)
             voice_rms = float(np.sqrt(np.sum(power[self.voice_bins]) * 4.0 / (self.n_fft * self.n_fft)))
+            self.recent_voice_rms.append(voice_rms)
+            if len(self.recent_voice_rms) > 3:
+                self.recent_voice_rms.pop(0)
 
             if not self.noise_initialized:
                 self.noise_mag = np.maximum(mag, 50.0)
@@ -195,30 +213,33 @@ class RealtimeVoiceIsolator:
             onset_thresh = max(
                 base_min_rms,
                 self.noise_floor_rms * (3.5 if in_bot_echo_guard else 2.8),
+                # Distant TV or talkers have speech-like spectra, so a new onset must also clearly
+                # beat the loudest recent background, not just its average level
+                self.background_peak_rms * 2.0,
                 self.foreground_voice_rms * (0.42 if in_bot_echo_guard else 0.30),
             )
             sustain_thresh = max(
                 self.min_voice_rms * 0.55,
                 self.noise_floor_rms * 1.8,
+                # A knock or clap can open the gate over a playing TV; don't let the TV hold it open
+                self.background_peak_rms * 0.8,
                 self.foreground_voice_rms * 0.16,
             )
 
             thresh = sustain_thresh if self.is_foreground_active else onset_thresh
             req_ratio = 0.32 if self.is_foreground_active else 0.45
             req_crest = 2.2 if self.is_foreground_active else 3.2
-            req_streak = 4 if in_bot_echo_guard else 2
+            # Speech sustains for 3+ hops (48 ms); a knock or clap is loud for 1-2 and then decays.
+            # A one-hop shortcut here let every knock open the gate over a playing TV for ~300 ms,
+            # long enough for Silero to hear the TV as the caller. The 3-hop lookahead still
+            # delivers the word's first consonant.
+            req_streak = 4 if in_bot_echo_guard else 3
 
             hop_is_voice = (voice_rms >= thresh) and (formant_ratio >= req_ratio) and (pitch_crest >= req_crest)
-            strong_onset = (
-                not in_bot_echo_guard
-                and (voice_rms >= onset_thresh * 1.25)
-                and (formant_ratio >= 0.50)
-                and (pitch_crest >= 4.0)
-            )
 
             if hop_is_voice:
                 self.active_streak += 1
-                if self.active_streak >= req_streak or strong_onset or self.is_foreground_active:
+                if self.active_streak >= req_streak or self.is_foreground_active:
                     self.is_foreground_active = True
                     self.hangover_hops = self.max_hangover_hops
                     # Adapt foreground speaker level toward clear speech peaks
@@ -233,12 +254,26 @@ class RealtimeVoiceIsolator:
                 else:
                     self.is_foreground_active = False
 
-                # Update background noise profile when foreground user is not speaking (and bot isn't speaking)
+                # Update background noise profile when foreground user is not speaking (and bot isn't speaking).
+                # Falls fast but rises at most ~1.5% per hop, so a word the detector hasn't confirmed yet
+                # isn't learned as "noise" (which would raise the onset threshold and mute the speaker),
+                # while a steady TV or street noise is still learned within about a second.
                 if not self.is_foreground_active and not in_bot_echo_guard:
-                    self.noise_mag = 0.90 * self.noise_mag + 0.10 * mag
-                    self.noise_floor_rms = float(
-                        np.clip(0.92 * self.noise_floor_rms + 0.08 * voice_rms, 40.0, 600.0)
-                    )
+                    sustained_rms = sorted(self.recent_voice_rms)[len(self.recent_voice_rms) // 2]
+                    if sustained_rms > self.background_peak_rms and pitch_crest >= 6.0:
+                        self.background_peak_rms = 0.75 * self.background_peak_rms + 0.25 * sustained_rms
+                    else:
+                        self.background_peak_rms *= 0.997
+                    self.noise_mag = np.where(
+                        mag < self.noise_mag,
+                        0.85 * self.noise_mag + 0.15 * mag,
+                        np.minimum(self.noise_mag * 1.015, 0.90 * self.noise_mag + 0.10 * mag),
+                    ).astype(np.float32)
+                    if voice_rms < self.noise_floor_rms:
+                        target = 0.85 * self.noise_floor_rms + 0.15 * voice_rms
+                    else:
+                        target = min(self.noise_floor_rms * 1.015, 0.92 * self.noise_floor_rms + 0.08 * voice_rms)
+                    self.noise_floor_rms = float(np.clip(target, 40.0, 1200.0))
                 elif not in_bot_echo_guard:
                     # Track downward minima even during speech pauses
                     self.noise_mag = np.minimum(self.noise_mag * 1.002, 0.80 * self.noise_mag + 0.20 * mag)
@@ -450,11 +485,90 @@ def build_vad_processor(stop_secs: float = 0.20, min_voice_rms: float = MIN_VOIC
     )
 
 
+class NoiseSafeUserTurnStartStrategy(BaseUserTurnStartStrategy):
+    """Starts the user turn on VAD while the bot is idle, but only on real words while it is busy.
+
+    A VAD start fires on coughs, TV, door slams and barks too. While the bot is idle that's
+    harmless (a turn with no transcript gets no answer). But while the bot is thinking or
+    speaking, a turn start interrupts it, and when no words follow, pipecat asks the caller to
+    repeat themselves. So while the bot is busy, the caller barges in only once Deepgram has
+    heard words that passed ``PhantomSpeechFilter``: two interim words, or a final transcript
+    (a single-word final needs higher confidence, e.g. „კი“ / „არა“).
+    """
+
+    def __init__(self, *, reply_wait_secs: float = 6.0, min_interim_words: int = 2, **kwargs):
+        super().__init__(**kwargs)
+        self._reply_wait_secs = reply_wait_secs
+        self._min_interim_words = min_interim_words
+        self._bot_speaking = False
+        self._turn_active = False
+        # Set when the user's turn ends and the LLM starts thinking; cleared once the bot speaks.
+        # Expires on its own because an empty turn never gets a reply.
+        self._awaiting_reply_since: float | None = None
+        # Deepgram sometimes sends a late extra final for words it already transcribed. Audio only
+        # reaches it after a VAD start, so a transcript with no VAD start since the turn ended is
+        # such a tail, not the caller speaking again, and must not cancel the reply being prepared.
+        self._voice_since_turn_end = True
+
+    def _bot_busy(self) -> bool:
+        if self._bot_speaking:
+            return True
+        since = self._awaiting_reply_since
+        return since is not None and (time.monotonic() - since) < self._reply_wait_secs
+
+    async def handle_user_turn_started(self):
+        await super().handle_user_turn_started()
+        self._turn_active = True
+        self._awaiting_reply_since = None
+
+    async def handle_user_turn_stopped(self):
+        await super().handle_user_turn_stopped()
+        self._turn_active = False
+        self._awaiting_reply_since = time.monotonic()
+        self._voice_since_turn_end = False
+
+    async def process_frame(self, frame: Frame) -> ProcessFrameResult:
+        if isinstance(frame, BotStartedSpeakingFrame):
+            self._bot_speaking = True
+            self._awaiting_reply_since = None
+        elif isinstance(frame, BotStoppedSpeakingFrame):
+            self._bot_speaking = False
+            self._awaiting_reply_since = None
+        elif isinstance(frame, VADUserStartedSpeakingFrame):
+            self._voice_since_turn_end = True
+            if not self._bot_busy():
+                await self.trigger_user_turn_started()
+                return ProcessFrameResult.STOP
+        elif isinstance(frame, (TranscriptionFrame, InterimTranscriptionFrame)):
+            if self._is_real_speech(frame):
+                await self.trigger_user_turn_started()
+                return ProcessFrameResult.STOP
+            if isinstance(frame, TranscriptionFrame) and not self._turn_active:
+                # Don't let a rejected noise word leak into the caller's next turn
+                await self.trigger_reset_aggregation()
+        return ProcessFrameResult.CONTINUE
+
+    def _is_real_speech(self, frame: TranscriptionFrame | InterimTranscriptionFrame) -> bool:
+        words = len(frame.text.split())
+        if words == 0:
+            return False
+        if not self._bot_busy():
+            return True
+        if not self._voice_since_turn_end:
+            return False
+        if isinstance(frame, InterimTranscriptionFrame):
+            return words >= self._min_interim_words
+        if words >= 2:
+            return True
+        conf = _deepgram_confidence(frame)
+        return conf is None or conf >= BARGE_IN_MIN_CONFIDENCE
+
+
 def build_user_params(user_speech_timeout: float = 0.20, mute_strategies=None) -> LLMUserAggregatorParams:
-    """Aggregator params: VAD-only turn start, fast silence-timeout turn end."""
+    """Aggregator params: noise-safe turn start (VAD when idle, words to barge in), fast silence-timeout turn end."""
     return LLMUserAggregatorParams(
         user_turn_strategies=UserTurnStrategies(
-            start=[VADUserTurnStartStrategy()],
+            start=[NoiseSafeUserTurnStartStrategy()],
             stop=[SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=user_speech_timeout)],
         ),
         user_mute_strategies=mute_strategies or [],
