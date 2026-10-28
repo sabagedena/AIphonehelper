@@ -1,0 +1,560 @@
+<!DOCTYPE html>
+<html lang="ka">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>ხმოვანი დამხმარე - Georgian AI Phone Helper</title>
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            -webkit-tap-highlight-color: transparent;
+        }
+
+        body {
+            background: linear-gradient(135deg, #0b0f19 0%, #1e293b 100%);
+            color: #f8fafc;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 16px;
+        }
+
+        .phone-card {
+            background: rgba(30, 41, 59, 0.85);
+            backdrop-filter: blur(20px);
+            border: 1px solid rgba(255, 255, 255, 0.12);
+            border-radius: 28px;
+            width: 100%;
+            max-width: 480px;
+            padding: 32px 24px;
+            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.6);
+            text-align: center;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+
+        .status-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 6px 16px;
+            border-radius: 20px;
+            background: rgba(148, 163, 184, 0.15);
+            font-size: 14px;
+            color: #94a3b8;
+            margin-bottom: 20px;
+        }
+
+        .status-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: #94a3b8;
+        }
+
+        .status-dot.active {
+            background: #22c55e;
+            box-shadow: 0 0 12px #22c55e;
+            animation: pulse 1.5s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; transform: scale(1); }
+            50% { opacity: 0.5; transform: scale(1.2); }
+        }
+
+        .avatar-circle {
+            width: 100px;
+            height: 100px;
+            border-radius: 50%;
+            background: linear-gradient(135deg, #3b82f6 0%, #8b5cf6 100%);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin-bottom: 16px;
+            box-shadow: 0 10px 25px -5px rgba(99, 102, 241, 0.5);
+            font-size: 44px;
+        }
+
+        h1 {
+            font-size: 22px;
+            font-weight: 700;
+            margin-bottom: 6px;
+            color: #ffffff;
+        }
+
+        p.subtitle {
+            font-size: 13px;
+            color: #94a3b8;
+            margin-bottom: 20px;
+            line-height: 1.5;
+        }
+
+        /* Live Mic Level Bar */
+        .mic-meter-container {
+            width: 80%;
+            height: 6px;
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 3px;
+            overflow: hidden;
+            margin-bottom: 18px;
+            display: none;
+        }
+
+        .mic-meter-fill {
+            height: 100%;
+            width: 0%;
+            background: #22c55e;
+            border-radius: 3px;
+            transition: width 0.05s ease;
+        }
+
+        .call-btn {
+            width: 76px;
+            height: 76px;
+            border-radius: 50%;
+            border: none;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 32px;
+            transition: all 0.25s ease;
+            box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.3);
+            margin-bottom: 12px;
+        }
+
+        .call-btn.start {
+            background: #22c55e;
+            color: white;
+        }
+
+        .call-btn.start:hover {
+            transform: scale(1.08);
+            background: #16a34a;
+            box-shadow: 0 0 25px rgba(34, 197, 94, 0.5);
+        }
+
+        .call-btn.end {
+            background: #ef4444;
+            color: white;
+            animation: pulse-end 2s infinite;
+        }
+
+        @keyframes pulse-end {
+            0%, 100% { box-shadow: 0 0 15px rgba(239, 68, 68, 0.5); }
+            50% { box-shadow: 0 0 30px rgba(239, 68, 68, 0.8); }
+        }
+
+        .call-btn.end:hover {
+            transform: scale(1.08);
+            background: #dc2626;
+        }
+
+        .btn-label {
+            font-size: 15px;
+            font-weight: 600;
+            color: #e2e8f0;
+            margin-bottom: 22px;
+        }
+
+        /* Live Subtitles / Transcript */
+        .transcript-container {
+            width: 100%;
+            background: rgba(15, 23, 42, 0.7);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            border-radius: 16px;
+            padding: 14px 16px;
+            text-align: left;
+            font-size: 13px;
+            max-height: 180px;
+            overflow-y: auto;
+            margin-bottom: 18px;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            scroll-behavior: smooth;
+        }
+
+        .msg-caller {
+            color: #60a5fa;
+            line-height: 1.45;
+            background: rgba(59, 130, 246, 0.12);
+            padding: 8px 12px;
+            border-radius: 12px;
+            border-left: 3px solid #3b82f6;
+        }
+
+        .msg-bot {
+            color: #a78bfa;
+            line-height: 1.45;
+            background: rgba(139, 92, 246, 0.12);
+            padding: 8px 12px;
+            border-radius: 12px;
+            border-left: 3px solid #8b5cf6;
+        }
+
+        .info-box {
+            width: 100%;
+            background: rgba(15, 23, 42, 0.4);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+            border-radius: 16px;
+            padding: 14px;
+            text-align: left;
+            font-size: 12px;
+            color: #94a3b8;
+            line-height: 1.5;
+        }
+
+        .info-box strong {
+            color: #cbd5e1;
+        }
+
+        .info-box ul {
+            padding-left: 18px;
+            margin-top: 6px;
+        }
+
+        .info-box li {
+            margin-bottom: 3px;
+        }
+
+        @media (max-width: 480px) {
+            body { padding: 10px; }
+            .phone-card { padding: 24px 16px; border-radius: 20px; }
+            .avatar-circle { width: 84px; height: 84px; font-size: 38px; }
+            h1 { font-size: 20px; }
+            .transcript-container { max-height: 150px; }
+        }
+    </style>
+</head>
+<body>
+    <div class="phone-card">
+        <div class="status-badge">
+            <div id="statusDot" class="status-dot"></div>
+            <span id="statusText">მზადაა დასარეკად</span>
+        </div>
+
+        <div class="avatar-circle">👵</div>
+
+        <h1>ხმოვანი დამხმარე</h1>
+        <p class="subtitle">დააჭირეთ მწვანე ღილაკს, დაელოდეთ მისალმებას და ესაუბრეთ ქართულად ჩვეულებრივად.</p>
+        <div style="display: inline-flex; align-items: center; gap: 6px; padding: 4px 12px; border-radius: 12px; background: rgba(34, 197, 94, 0.15); font-size: 12px; color: #86efac; margin-bottom: 14px; border: 1px solid rgba(34, 197, 94, 0.3);">
+            🇬🇪 100% მშობლიური ქართული ხმა (0% აქცენტი)
+        </div>
+
+        <!-- Voice & Pace Settings -->
+        <div style="display: flex; gap: 8px; width: 100%; margin-bottom: 16px; justify-content: center; flex-wrap: wrap;">
+            <select id="voiceSelect" style="background: rgba(15, 23, 42, 0.85); color: #f1f5f9; border: 1px solid rgba(255, 255, 255, 0.18); border-radius: 12px; padding: 7px 12px; font-size: 13px; outline: none; cursor: pointer;">
+                <option value="ka-GE-EkaNeural" selected>👩 ეკა (ქალის მშობლიური ხმა)</option>
+                <option value="ka-GE-GiorgiNeural">👨 გიორგი (კაცის მშობლიური ხმა)</option>
+            </select>
+            <select id="rateSelect" style="background: rgba(15, 23, 42, 0.85); color: #f1f5f9; border: 1px solid rgba(255, 255, 255, 0.18); border-radius: 12px; padding: 7px 10px; font-size: 13px; outline: none; cursor: pointer;">
+                <option value="+0%" selected>ნორმალური ტემპი</option>
+                <option value="-5%">მშვიდი (-5%)</option>
+                <option value="-10%">ნელი / უფროსებისთვის (-10%)</option>
+            </select>
+        </div>
+
+        <!-- Live Mic Meter -->
+        <div id="micMeter" class="mic-meter-container">
+            <div id="micFill" class="mic-meter-fill"></div>
+        </div>
+
+        <button id="callBtn" class="call-btn start" onclick="toggleCall()" aria-label="დარეკვა">📞</button>
+        <div id="btnLabel" class="btn-label">დარეკვა</div>
+
+        <!-- Live Transcript -->
+        <div id="transcriptBox" class="transcript-container" style="display: none;"></div>
+
+        <div class="info-box">
+            <strong>რჩევა სასაუბროდ:</strong>
+            <ul>
+                <li>„ბანკიდან დამირეკეს და ბარათის კოდს მთხოვენ, რა ვქნა?“</li>
+                <li>„ხახვი და ხუთი ლარი როგორ გამოითქმის?“</li>
+                <li>„როგორ გავადიდო ტელეფონზე შრიფტი?“</li>
+            </ul>
+        </div>
+    </div>
+
+    <script>
+        let ws = null;
+        let audioCtx = null;
+        let micStream = null;
+        let processor = null;
+        let zeroGain = null;
+        let isCalling = false;
+        let meterInterval = null;
+        let nextPlayTime = 0;
+        let activeSources = [];
+
+        function clearQueuedAudio() {
+            for (const src of activeSources) {
+                try { src.stop(); } catch (e) {}
+                try { src.disconnect(); } catch (e) {}
+            }
+            activeSources = [];
+            nextPlayTime = 0;
+        }
+
+        const TARGET_SAMPLE_RATE = 16000;
+
+        async function toggleCall() {
+            if (!isCalling) {
+                await startCall();
+            } else {
+                stopCall();
+            }
+        }
+
+        // Resamples audio buffer from browser sampleRate to 16,000 Hz PCM16
+        function resampleTo16kPCM(inputBuffer, sourceRate) {
+            if (sourceRate === TARGET_SAMPLE_RATE) {
+                const pcm16 = new Int16Array(inputBuffer.length);
+                for (let i = 0; i < inputBuffer.length; i++) {
+                    let s = Math.max(-1, Math.min(1, inputBuffer[i]));
+                    pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+                }
+                return pcm16.buffer;
+            }
+
+            const ratio = sourceRate / TARGET_SAMPLE_RATE;
+            const newLength = Math.round(inputBuffer.length / ratio);
+            const pcm16 = new Int16Array(newLength);
+            let offsetResult = 0;
+            let offsetBuffer = 0;
+
+            while (offsetResult < newLength) {
+                const nextOffsetBuffer = Math.round((offsetResult + 1) * ratio);
+                let accum = 0, count = 0;
+                for (let i = offsetBuffer; i < nextOffsetBuffer && i < inputBuffer.length; i++) {
+                    accum += inputBuffer[i];
+                    count++;
+                }
+                const avg = count > 0 ? accum / count : 0;
+                const s = Math.max(-1, Math.min(1, avg));
+                pcm16[offsetResult] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+                offsetResult++;
+                offsetBuffer = nextOffsetBuffer;
+            }
+            return pcm16.buffer;
+        }
+
+        async function startCall() {
+            const btn = document.getElementById('callBtn');
+            const label = document.getElementById('btnLabel');
+            const dot = document.getElementById('statusDot');
+            const status = document.getElementById('statusText');
+            const meter = document.getElementById('micMeter');
+            const micFill = document.getElementById('micFill');
+            const transcriptBox = document.getElementById('transcriptBox');
+
+            try {
+                // 1. AudioContext must be created and resumed during user click
+                const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+                audioCtx = new AudioContextClass();
+                if (audioCtx.state === 'suspended') {
+                    await audioCtx.resume();
+                }
+
+                // 2. Request user microphone
+                micStream = await navigator.mediaDevices.getUserMedia({
+                    audio: {
+                        channelCount: 1,
+                        echoCancellation: true,
+                        noiseSuppression: true,
+                        autoGainControl: true
+                    }
+                });
+
+                // 3. Connect WebSocket with selected Georgian voice & pacing
+                const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+                const voiceVal = document.getElementById('voiceSelect').value;
+                const rateVal = document.getElementById('rateSelect').value;
+                document.getElementById('voiceSelect').disabled = true;
+                document.getElementById('rateSelect').disabled = true;
+                ws = new WebSocket(`${protocol}//${window.location.host}/browser-call?voice=${encodeURIComponent(voiceVal)}&rate=${encodeURIComponent(rateVal)}`);
+                ws.binaryType = 'arraybuffer';
+
+                ws.onopen = () => {
+                    isCalling = true;
+                    btn.className = 'call-btn end';
+                    btn.innerHTML = '🛑';
+                    label.innerText = 'ზარის გათიშვა';
+                    dot.className = 'status-dot active';
+                    status.innerText = 'მიმდინარეობს ზარი...';
+                    meter.style.display = 'block';
+                    transcriptBox.style.display = 'flex';
+                    transcriptBox.innerHTML = '<div class="msg-bot" id="initialBotMsg">🤖 <strong>დამხმარე:</strong> უერთდება...</div>';
+
+                    // 4. Set up Microphone Audio Pipeline
+                    const source = audioCtx.createMediaStreamSource(micStream);
+                    
+                    // Visual mic level analyzer
+                    const analyser = audioCtx.createAnalyser();
+                    analyser.fftSize = 256;
+                    source.connect(analyser);
+
+                    const dataArray = new Uint8Array(analyser.frequencyBinCount);
+                    meterInterval = setInterval(() => {
+                        analyser.getByteFrequencyData(dataArray);
+                        let sum = 0;
+                        for (let i = 0; i < dataArray.length; i++) sum += dataArray[i];
+                        let avg = sum / dataArray.length;
+                        let pct = Math.min(100, Math.round((avg / 128) * 100));
+                        micFill.style.width = pct + '%';
+                    }, 50);
+
+                    // Audio processor node for low-latency PCM streaming (~21ms chunks)
+                    processor = audioCtx.createScriptProcessor(1024, 1, 1);
+
+                    processor.onaudioprocess = (e) => {
+                        if (ws && ws.readyState === WebSocket.OPEN) {
+                            const floatData = e.inputBuffer.getChannelData(0);
+                            const pcmBuffer = resampleTo16kPCM(floatData, audioCtx.sampleRate);
+                            ws.send(pcmBuffer);
+                        }
+                    };
+
+                    // Route through zero-gain node so user does NOT hear their own mic echo
+                    zeroGain = audioCtx.createGain();
+                    zeroGain.gain.value = 0;
+
+                    source.connect(processor);
+                    processor.connect(zeroGain);
+                    zeroGain.connect(audioCtx.destination);
+                };
+
+                nextPlayTime = 0;
+
+                ws.onmessage = async (event) => {
+                    if (event.data instanceof ArrayBuffer) {
+                        try {
+                            // Play received audio PCM 16kHz
+                            const pcm16 = new Int16Array(event.data);
+                            if (pcm16.length === 0) return;
+                            const float32 = new Float32Array(pcm16.length);
+                            for (let i = 0; i < pcm16.length; i++) {
+                                float32[i] = pcm16[i] / (pcm16[i] < 0 ? 0x8000 : 0x7FFF);
+                            }
+
+                            const audioBuffer = audioCtx.createBuffer(1, float32.length, 16000);
+                            audioBuffer.copyToChannel(float32, 0);
+
+                            const sourceNode = audioCtx.createBufferSource();
+                            sourceNode.buffer = audioBuffer;
+                            sourceNode.connect(audioCtx.destination);
+                            sourceNode.onended = () => {
+                                const idx = activeSources.indexOf(sourceNode);
+                                if (idx !== -1) activeSources.splice(idx, 1);
+                            };
+                            activeSources.push(sourceNode);
+
+                            const now = audioCtx.currentTime;
+                            if (nextPlayTime < now) {
+                                nextPlayTime = now;
+                            }
+                            sourceNode.start(nextPlayTime);
+                            nextPlayTime += audioBuffer.duration;
+                        } catch (audioErr) {
+                            console.warn("Audio buffer playback note:", audioErr);
+                        }
+                    } else if (typeof event.data === 'string') {
+                        try {
+                            const data = JSON.parse(event.data);
+                            if (data.type === 'clear_audio') {
+                                clearQueuedAudio();
+                                return;
+                            }
+                            const initialMsg = document.getElementById('initialBotMsg');
+                            if (initialMsg) {
+                                initialMsg.remove();
+                            }
+
+                            if (data.type === 'transcript_user') {
+                                transcriptBox.innerHTML += `<div class="msg-caller">🗣️ <strong>თქვენ:</strong> ${data.text}</div>`;
+                                transcriptBox.scrollTop = transcriptBox.scrollHeight;
+                            } else if (data.type === 'transcript_bot') {
+                                transcriptBox.innerHTML += `<div class="msg-bot">🤖 <strong>დამხმარე:</strong> ${data.text}</div>`;
+                                transcriptBox.scrollTop = transcriptBox.scrollHeight;
+                            }
+                        } catch(e) {
+                            console.error('Transcript parse error:', e);
+                        }
+                    }
+                };
+
+                ws.onclose = () => {
+                    stopCall();
+                };
+
+                ws.onerror = (err) => {
+                    console.error("WebSocket error:", err);
+                    stopCall();
+                };
+
+            } catch (err) {
+                alert("მიკროფონთან წვდომა ვერ მოხერხდა: " + err.message);
+                stopCall();
+            }
+        }
+
+        function stopCall() {
+            isCalling = false;
+            clearQueuedAudio();
+            const btn = document.getElementById('callBtn');
+            const label = document.getElementById('btnLabel');
+            const dot = document.getElementById('statusDot');
+            const status = document.getElementById('statusText');
+            const meter = document.getElementById('micMeter');
+
+            if (meterInterval) {
+                clearInterval(meterInterval);
+                meterInterval = null;
+            }
+            if (meter) meter.style.display = 'none';
+
+            if (ws) {
+                try {
+                    if (ws.readyState === WebSocket.OPEN) {
+                        ws.send(JSON.stringify({ type: 'hangup' }));
+                    }
+                    ws.close();
+                } catch(e) {}
+                ws = null;
+            }
+            if (processor) {
+                try { processor.disconnect(); } catch(e) {}
+                processor = null;
+            }
+            if (zeroGain) {
+                try { zeroGain.disconnect(); } catch(e) {}
+                zeroGain = null;
+            }
+            if (micStream) {
+                micStream.getTracks().forEach(track => track.stop());
+                micStream = null;
+            }
+            if (audioCtx) {
+                try { audioCtx.close(); } catch(e) {}
+                audioCtx = null;
+            }
+
+            btn.className = 'call-btn start';
+            btn.innerHTML = '📞';
+            label.innerText = 'დარეკვა';
+            dot.className = 'status-dot';
+            status.innerText = 'ზარი დასრულდა';
+            const vs = document.getElementById('voiceSelect');
+            const rs = document.getElementById('rateSelect');
+            if (vs) vs.disabled = false;
+            if (rs) rs.disabled = false;
+        }
+    </script>
+</body>
+</html>

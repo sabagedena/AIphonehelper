@@ -1,0 +1,23 @@
+# Secret environment variables (NEVER COMMIT)
+.env
+
+# Python virtual environment
+.venv/
+venv/
+ENV/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Audio / Temp test files
+*.wav
+*.mp3
+test_samples/
+voice_samples/
+
+# OS / Editor files
+.vscode/
+.idea/
+*.log
