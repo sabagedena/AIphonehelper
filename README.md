@@ -57,4 +57,4 @@ Expose it to the internet with `ngrok http 8000` and link your Twilio number's i
 | `EDGE_TTS_VOICE` | Voice: `ka-GE-EkaNeural` (Female) / `ka-GE-GiorgiNeural` (Male) | `ka-GE-EkaNeural` |
 | `EDGE_TTS_RATE` | Speech rate multiplier | `+12%` |
 | `MIC_DEVICE_INDEX` | Force specific mic index from `list_mics.py` (empty = auto) | `` |
-| `MIN_STT_CONFIDENCE`| Drops phantom words generated from background noise | `0.45` |
+| `MIN_STT_CONFIDENCE`| Drops phantom words generated from background noise | `0.55` |

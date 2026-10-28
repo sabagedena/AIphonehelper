@@ -108,6 +108,7 @@ _LATIN_LETTER_TO_GEORGIAN = str.maketrans(
     "abgdevztiklmnoprsufqhjcxwy",
     "აბგდევზთიკლმნოპრსუფქჰჯცხვი",
 )
+_MARKUP = re.compile(r"<[^<>]{1,40}>|\*{1,3}|_{2,}|`+|^\s*#{1,6}\s*", re.MULTILINE)
 _LATIN_IN_GEORGIAN_WORD = re.compile(r"(?<=[ა-ჰ])[A-Za-z]+|[A-Za-z]+(?=[ა-ჰ])")
 
 
@@ -119,6 +120,9 @@ def normalize_georgian_text(text: str) -> str:
     - Converts numbers (up to hundreds of billions) to full Georgian words.
     - Expands currency and percentage symbols.
     """
+    # 0. Drop markup the LLM sometimes emits (<h2>, **bold**, # headings), which TTS would spell out
+    text = _MARKUP.sub(" ", text)
+
     # 1. Expand Latin tech keywords to Georgian phonetic equivalents
     for pattern, replacement in _LATIN_TO_GEORGIAN_PHONETICS.items():
         text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)

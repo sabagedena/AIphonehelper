@@ -59,8 +59,9 @@ from pipecat.turns.user_start import BaseUserTurnStartStrategy
 from pipecat.turns.user_stop import SpeechTimeoutUserTurnStopStrategy
 from pipecat.turns.user_turn_strategies import UserTurnStrategies
 
-# Deepgram confidence below this is treated as a noise hallucination.
-MIN_STT_CONFIDENCE = float(os.getenv("MIN_STT_CONFIDENCE", "0.65"))
+# Deepgram confidence below this is treated as a noise hallucination. On live calls real Georgian
+# words scored 0.57-0.64 and were lost, while noise fragments scored 0.17-0.39.
+MIN_STT_CONFIDENCE = float(os.getenv("MIN_STT_CONFIDENCE", "0.55"))
 # Minimum foreground voice-band RMS (int16 scale) required to open the voice isolator gate.
 MIN_VOICE_RMS = float(os.getenv("MIN_VOICE_RMS", "600.0"))
 # Starting estimate of the caller's close-talk voice level (int16 voice-band RMS), and caps on how far
@@ -68,6 +69,11 @@ MIN_VOICE_RMS = float(os.getenv("MIN_VOICE_RMS", "600.0"))
 _DEFAULT_FOREGROUND_RMS = 1800.0
 _MAX_FOREGROUND_ONSET_RMS = 750.0
 _MAX_FOREGROUND_SUSTAIN_RMS = 400.0
+# The background tracker rises gradually (~0.16 s time constant): a TV plays for many seconds, while a
+# caller's soft first words last one or two and would otherwise be learned as background (seen on a
+# live call: soft speech raised it from 285 to 1214 in 2 s and was never heard)
+_BACKGROUND_ATTACK = float(os.getenv("GATE_BACKGROUND_ATTACK", "0.1"))
+_BACKGROUND_MAX_SHARE = float(os.getenv("GATE_BACKGROUND_MAX_SHARE", "0.6"))
 # A one-word transcript may interrupt the speaking bot only above this Deepgram confidence.
 BARGE_IN_MIN_CONFIDENCE = float(os.getenv("BARGE_IN_MIN_CONFIDENCE", "0.80"))
 # How long after VAD says "stopped" we still accept late STT finals.
@@ -271,9 +277,14 @@ class RealtimeVoiceIsolator:
                 if not self.is_foreground_active and not in_bot_echo_guard:
                     sustained_rms = sorted(self.recent_voice_rms)[len(self.recent_voice_rms) // 2]
                     if sustained_rms > self.background_peak_rms and pitch_crest >= 6.0:
-                        self.background_peak_rms = 0.75 * self.background_peak_rms + 0.25 * sustained_rms
+                        self.background_peak_rms += _BACKGROUND_ATTACK * (sustained_rms - self.background_peak_rms)
                     else:
                         self.background_peak_rms *= 0.997
+                    # Never above a fraction of the caller's own level: a soft-spoken caller whose first
+                    # words haven't opened the gate yet must not become the "background" that keeps it shut
+                    self.background_peak_rms = min(
+                        self.background_peak_rms, _BACKGROUND_MAX_SHARE * self.foreground_voice_rms
+                    )
                     self.noise_mag = np.where(
                         mag < self.noise_mag,
                         0.85 * self.noise_mag + 0.15 * mag,
