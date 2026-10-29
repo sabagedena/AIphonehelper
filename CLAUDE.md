@@ -49,15 +49,20 @@ This project is a **real-time, sub-second latency conversational Voice AI assist
      │
      ▼
 [LLM Engine] (bot.py)
-  • FastGoogleLLMService (one hedge request after 1.0s, a keep-warm connection; models that
-    return 429 quota errors are skipped until their retry delay passes)
+  • FastGoogleLLMService (hedge requests at 1.0s to another model family (gemini-3.6-flash) and 3.0s
+    to the next fallback, replies passed on in whole sentences and capped at four, a cut-off
+    fragment dropped when max_tokens is hit, back-to-back user turns joined into one before sending,
+    spoken fillers at 2.5s („ერთი წამით“) and 7s (sent to TTS as their own utterances), a spoken
+    apology if every model fails or nothing arrives in 15s, a keep-warm
+    connection; models that return 429 quota errors are skipped until their retry delay passes)
   • OR AnthropicLLMService (Claude Haiku 4.5 with prompt caching)
-  • System prompt: GEORGIAN_PROMPT (prompts.py)
+  • System prompt: build_system_prompt() (prompts.py) = GEORGIAN_PROMPT + the call's Tbilisi date/time
      │
      ▼
 [Georgian Edge Neural TTS] (edge_tts_service.py)
   • Text normalization: Latin loanwords -> Georgian phonetic Mkedruli
-  • Number normalization: Digits (up to hundreds of billions) -> Georgian words (number_to_georgian)
+  • Number normalization: Digits (up to hundreds of billions) -> Georgian words (number_to_georgian);
+    phone numbers and *codes read in dictation groups, times, decimals, ordinals, case endings
   • Persistent warm WebSocket connection reuse
   • Resampling via soxr & streaming chunk playback
      │
@@ -186,7 +191,7 @@ Edge TTS requires pure Georgian characters (Mkedruli) to avoid unnatural robotic
 3. **Always run text through `normalize_georgian_text()`** before speech synthesis.
 
 ### B. Elderly-Centric Persona & Safety Guardrails (`prompts.py`)
-- **Tone**: Warm, patient, respectful, addressing users with „თქვენ“, „ბატონო“ / „ქალბატონო“.
+- **Tone**: Warm, patient, respectful, addressing users with „თქვენ“; „ბატონო“ / „ქალბატონო“ only when the caller's gender is clear (never „ბატონო ან ქალბატონო“).
 - **Brevity**: Maximum 2-3 short sentences per turn. Elderly listeners lose track with long instructions.
 - **Anti-Scam Protection**: Never ask for card numbers, PIN codes, or SMS codes. Immediately warn: *„ეს თაღლითობაა! ბანკი არასდროს გკითხავთ კოდს ტელეფონით. დაუყოვნებლივ გათიშეთ ზარი.“*
 - **Emergency / Health**: Never diagnose medical conditions. If severe distress is detected: *„გთხოვთ ახლავე გათიშოთ ზარი და დარეკოთ ას თორმეტზე!“*.
@@ -203,6 +208,10 @@ Edge TTS requires pure Georgian characters (Mkedruli) to avoid unnatural robotic
 - `SpeechOnlyAudioGate` buffers 0.35s before voice starts and cuts off audio transmission when VAD stops.
 - Transcripts with confidence score < `MIN_STT_CONFIDENCE` (0.55) are discarded by `PhantomSpeechFilter`.
 - `NoiseSafeUserTurnStartStrategy` starts the user turn on VAD only while the bot is idle. While the bot is thinking or speaking, only recognized words may interrupt it (two interim words, or a final transcript; a one-word final needs `BARGE_IN_MIN_CONFIDENCE`, default 0.80). Without this, any noise that passes VAD cuts the bot off and pipecat asks the caller to repeat.
+- While the reply is still being prepared (nothing playing yet), any recognized word counts, so a caller who paused mid-sentence and goes on cancels the half-question's reply and the LLM gets both parts.
+- `BotReplyTracker` (right after the TTS service in every pipeline) keeps the bot "busy" between two sentences of one reply; pipecat reports the bot stopped whenever 0.35 s pass without audio, and noise in that gap used to cut replies off.
+- `CompleteUtteranceUserTurnStopStrategy` ends the turn only after Deepgram has answered the Finalize sent on VAD stop (`FlushReportingDeepgramSTTService` reports it, 1.5 s cap). Those answers carry the caller's last words; ending the turn earlier lost them. It then waits `utterance_end_wait()` longer when the words sound unfinished (no final punctuation, a lone word, a trailing comma or conjunction).
+- Build Deepgram with `build_stt()` (bot.py), never `DeepgramSTTService` directly.
 - Audio that bypasses the pipeline (the cached phone greeting) must be wrapped in `BotStartedSpeakingFrame` / `BotStoppedSpeakingFrame` so the turn strategy and echo guard know the bot is speaking.
 - If modifying audio logic, never send raw continuous non-voice audio directly to Deepgram.
 

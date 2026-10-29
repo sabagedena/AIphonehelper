@@ -1,0 +1,20 @@
+# Always-on Georgian phone line on a Linux server:
+#   docker compose up -d --build
+#   docker compose logs -f
+services:
+  phone:
+    build: .
+    container_name: georgian-ai-phone
+    # SIP uses UDP 5060 and each call picks a random RTP port in 10000-20000,
+    # so the container shares the server's network instead of publishing ports.
+    network_mode: host
+    env_file: .env
+    restart: unless-stopped
+    volumes:
+      # Only used when RECORD_CALLS=true
+      - ./recordings:/app/recordings
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"

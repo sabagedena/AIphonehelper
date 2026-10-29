@@ -1,38 +1,36 @@
 import asyncio
 import json
 import os
+import time
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from loguru import logger
 from dotenv import load_dotenv
 
-from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.frames.frames import (
-    AudioRawFrame,
-    EndFrame,
     InputAudioRawFrame,
     InterruptionFrame,
+    LLMFullResponseEndFrame,
+    LLMFullResponseStartFrame,
+    LLMTextFrame,
     OutputAudioRawFrame,
+    StartFrame,
     TTSSpeakFrame,
     TranscriptionFrame,
-    TextFrame,
 )
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.llm_context import LLMContext
-from pipecat.processors.aggregators.llm_response_universal import (
-    LLMContextAggregatorPair,
-    LLMUserAggregatorParams,
-)
+from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
-from pipecat.services.deepgram.stt import DeepgramSTTService
+from pipecat.transports.base_output import BaseOutputTransport
+from pipecat.transports.base_transport import TransportParams
 
-from bot import build_llm, build_tts
-from prompts import GEORGIAN_PROMPT, INITIAL_GREETING
-from speech_gate import PhantomSpeechFilter, SpeechOnlyAudioGate, build_user_params, build_vad_processor
+from bot import DEFAULT_EDGE_TTS_RATE, build_llm, build_stt, build_tts
+from prompts import INITIAL_GREETING
+from speech_gate import BotReplyTracker, PhantomSpeechFilter, SpeechOnlyAudioGate, build_user_params, build_vad_processor
 
 load_dotenv()
 
@@ -44,11 +42,20 @@ BROWSER_SAMPLE_RATE = 16000
 class BrowserAudioInput(FrameProcessor):
     """Pushes audio from browser websocket into Pipecat pipeline."""
 
+    def __init__(self):
+        super().__init__()
+        self._started = False
+
     async def process_frame(self, frame, direction):
         await super().process_frame(frame, direction)
+        if isinstance(frame, StartFrame):
+            self._started = True
         await self.push_frame(frame, direction)
 
     async def push_pcm(self, pcm_bytes: bytes):
+        # Mic audio that arrives before the pipeline has started would only be dropped with errors
+        if not self._started:
+            return
         frame = InputAudioRawFrame(
             audio=pcm_bytes,
             sample_rate=BROWSER_SAMPLE_RATE,
@@ -57,48 +64,81 @@ class BrowserAudioInput(FrameProcessor):
         await self.push_frame(frame, FrameDirection.DOWNSTREAM)
 
 
-class BrowserAudioOutput(FrameProcessor):
-    """Sends audio and transcripts back through browser websocket."""
+class BrowserAudioOutput(BaseOutputTransport):
+    """Sends the bot's audio to the browser at playback speed.
 
-    def __init__(self, websocket: WebSocket):
+    An output transport, not a plain processor: only an output transport reports
+    BotStartedSpeakingFrame / BotStoppedSpeakingFrame, which the turn strategy and the echo guard
+    need to know the bot is talking. Sending a whole reply in one burst also made pipecat think the
+    bot had finished while the browser was still playing it.
+    """
+
+    # How far ahead of playback audio may be sent, so the browser never runs dry
+    _LEAD_SECS = 0.12
+
+    def __init__(self, websocket: WebSocket, params: TransportParams, **kwargs):
+        super().__init__(params=params, **kwargs)
+        self._websocket = websocket
+        self._play_until = 0.0
+
+    async def start(self, frame: StartFrame):
+        await super().start(frame)
+        await self.set_transport_ready(frame)
+
+    async def process_frame(self, frame, direction):
+        if isinstance(frame, InterruptionFrame):
+            self._play_until = 0.0
+            await self._send_json({"type": "clear_audio"})
+        await super().process_frame(frame, direction)
+
+    async def write_audio_frame(self, frame: OutputAudioRawFrame) -> bool:
+        try:
+            await self._websocket.send_bytes(frame.audio)
+        except Exception:
+            return False
+        now = time.monotonic()
+        self._play_until = max(self._play_until, now) + len(frame.audio) / (2 * frame.sample_rate * frame.num_channels)
+        await asyncio.sleep(max(0.0, self._play_until - now - self._LEAD_SECS))
+        return True
+
+    async def _send_json(self, data: dict):
+        try:
+            await self._websocket.send_text(json.dumps(data, ensure_ascii=False))
+        except Exception:
+            pass
+
+
+class BrowserTranscriptSender(FrameProcessor):
+    """Shows the call's transcript in the browser: the caller's words (place before the user
+    aggregator, which consumes them) or the bot's replies (place right after the LLM)."""
+
+    def __init__(self, websocket: WebSocket, role: str):
         super().__init__()
         self._websocket = websocket
+        self._role = role
+        self._bot_text: list[str] = []
+
+    async def _send(self, text: str):
+        text = text.strip()
+        if not text:
+            return
+        try:
+            await self._websocket.send_text(json.dumps({"type": f"transcript_{self._role}", "text": text}, ensure_ascii=False))
+        except Exception:
+            pass
 
     async def process_frame(self, frame, direction):
         await super().process_frame(frame, direction)
-
-        if isinstance(frame, OutputAudioRawFrame):
-            try:
-                # Send raw binary audio buffer to browser
-                await self._websocket.send_bytes(frame.audio)
-            except Exception:
-                pass
-        elif isinstance(frame, InterruptionFrame):
-            try:
-                await self._websocket.send_text(json.dumps({"type": "clear_audio"}))
-            except Exception:
-                pass
-        elif isinstance(frame, TranscriptionFrame):
-            # User spoke something (Deepgram transcribed it)
-            if frame.text and frame.text.strip():
-                try:
-                    await self._websocket.send_text(json.dumps({
-                        "type": "transcript_user",
-                        "text": frame.text.strip()
-                    }))
-                except Exception:
-                    pass
-        elif isinstance(frame, TextFrame) and not getattr(frame, "will_be_spoken", False):
-            # Bot spoke something
-            if frame.text and frame.text.strip():
-                try:
-                    await self._websocket.send_text(json.dumps({
-                        "type": "transcript_bot",
-                        "text": frame.text.strip()
-                    }))
-                except Exception:
-                    pass
-
+        if self._role == "user" and isinstance(frame, TranscriptionFrame):
+            await self._send(frame.text)
+        elif self._role == "bot":
+            if isinstance(frame, LLMFullResponseStartFrame):
+                self._bot_text = []
+            elif isinstance(frame, LLMTextFrame):
+                self._bot_text.append(frame.text)
+            elif isinstance(frame, (LLMFullResponseEndFrame, InterruptionFrame)) and self._bot_text:
+                await self._send("".join(self._bot_text))
+                self._bot_text = []
         await self.push_frame(frame, direction)
 
 
@@ -116,24 +156,20 @@ async def browser_call_ws(websocket: WebSocket):
     logger.info("Browser call connected!")
 
     audio_in = BrowserAudioInput()
-    audio_out = BrowserAudioOutput(websocket)
+    audio_out = BrowserAudioOutput(
+        websocket,
+        TransportParams(audio_out_enabled=True, audio_out_sample_rate=BROWSER_SAMPLE_RATE),
+    )
 
     # 1. Listen (Deepgram Georgian)
-    stt = DeepgramSTTService(
-        api_key=os.getenv("DEEPGRAM_API_KEY"),
-        settings=DeepgramSTTService.Settings(
-            model=os.getenv("DEEPGRAM_MODEL", "nova-3"),
-            language="ka",
-            smart_format=True,
-        ),
-    )
+    stt = build_stt()
 
     # 2. Think (Gemini / Claude)
     llm = build_llm()
 
     # 3. Speak: Native Georgian Voice (0% foreign accent, recorded in Georgia)
     selected_voice = websocket.query_params.get("voice") or os.getenv("EDGE_TTS_VOICE", "ka-GE-EkaNeural")
-    selected_rate = websocket.query_params.get("rate") or os.getenv("EDGE_TTS_RATE", "+0%")
+    selected_rate = websocket.query_params.get("rate") or os.getenv("EDGE_TTS_RATE", DEFAULT_EDGE_TTS_RATE)
     logger.info(f"Setting up TTS: voice={selected_voice}, rate={selected_rate}")
     tts = build_tts(
         sample_rate=BROWSER_SAMPLE_RATE,
@@ -157,9 +193,12 @@ async def browser_call_ws(websocket: WebSocket):
             SpeechOnlyAudioGate(),
             stt,
             phantom_filter,
+            BrowserTranscriptSender(websocket, "user"),
             context_aggregator.user(),
             llm,
+            BrowserTranscriptSender(websocket, "bot"),
             tts,
+            BotReplyTracker(),
             audio_out,
             context_aggregator.assistant(),
         ]
@@ -229,6 +268,8 @@ async def browser_call_ws(websocket: WebSocket):
 
 if __name__ == "__main__":
     import uvicorn
+    # Pay the one-time Gemini client setup (TLS context, imports) now rather than in the first call
+    build_llm()
     port = int(os.getenv("PORT", 8000))
     host = os.getenv("HOST", "0.0.0.0")
     uvicorn.run("server_web:app", host=host, port=port, reload=False)

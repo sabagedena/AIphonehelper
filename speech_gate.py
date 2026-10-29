@@ -28,15 +28,24 @@ The multi-layer solution implemented here:
          with a 0.35s pre-roll and 0.24s clean trailing silence before STT finalize.
     3. ``PhantomSpeechFilter``:
        - Drops any low-confidence or noise-induced transcripts.
-    4. ``NoiseSafeUserTurnStartStrategy``:
-       - While the bot is thinking or speaking, only recognized words (not VAD alone)
-         may interrupt it, so a cough or a door slam never cuts the bot off.
+    4. ``NoiseSafeUserTurnStartStrategy`` + ``BotReplyTracker``:
+       - While the bot is thinking or speaking (including gaps between its sentences),
+         only recognized words (not VAD alone) may interrupt it, so a cough or a door slam
+         never cuts the bot off.
+    5. ``CompleteUtteranceUserTurnStopStrategy`` + ``FlushReportingDeepgramSTTService``:
+       - Ends the caller's turn only after Deepgram has delivered the last words, and waits
+         longer when the words so far sound unfinished, so a pause mid-sentence doesn't
+         send half a question to the LLM.
 """
 
+import asyncio
 import os
+import re
 import time
+from dataclasses import dataclass, field
 
 import numpy as np
+from deepgram.listen.v1.types import ListenV1Results
 from loguru import logger
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
@@ -44,19 +53,28 @@ from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.frames.frames import (
     BotStartedSpeakingFrame,
     BotStoppedSpeakingFrame,
+    ControlFrame,
     Frame,
     InputAudioRawFrame,
     InterimTranscriptionFrame,
+    InterruptionFrame,
+    LLMFullResponseEndFrame,
+    LLMFullResponseStartFrame,
+    SystemFrame,
     TranscriptionFrame,
+    TTSStartedFrame,
+    TTSStoppedFrame,
     VADUserStartedSpeakingFrame,
     VADUserStoppedSpeakingFrame,
 )
 from pipecat.processors.aggregators.llm_response_universal import LLMUserAggregatorParams
 from pipecat.processors.audio.vad_processor import VADProcessor
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.turns.types import ProcessFrameResult
+from pipecat.turns.user_mute.always_user_mute_strategy import AlwaysUserMuteStrategy
 from pipecat.turns.user_start import BaseUserTurnStartStrategy
-from pipecat.turns.user_stop import SpeechTimeoutUserTurnStopStrategy
+from pipecat.turns.user_stop import BaseUserTurnStopStrategy
 from pipecat.turns.user_turn_strategies import UserTurnStrategies
 
 # Deepgram confidence below this is treated as a noise hallucination. On live calls real Georgian
@@ -78,6 +96,11 @@ _BACKGROUND_MAX_SHARE = float(os.getenv("GATE_BACKGROUND_MAX_SHARE", "0.6"))
 BARGE_IN_MIN_CONFIDENCE = float(os.getenv("BARGE_IN_MIN_CONFIDENCE", "0.80"))
 # How long after VAD says "stopped" we still accept late STT finals.
 TRANSCRIPT_GRACE_SECS = 2.0
+
+
+def _plain_words(text: str) -> list[str]:
+    """Lower-cased words without punctuation, for comparing transcripts."""
+    return re.findall(r"[^\W\d_]+", text.lower())
 
 
 def _deepgram_confidence(frame: Frame) -> float | None:
@@ -453,6 +476,9 @@ class PhantomSpeechFilter(FrameProcessor):
         self._grace_secs = grace_secs
         self._vad_speaking = False
         self._last_vad_stop = 0.0
+        # Words of the last final passed on, and where in Deepgram's audio stream it ended (seconds)
+        self._last_final_words: list[str] = []
+        self._last_final_end = 0.0
 
     def _speech_recent(self) -> bool:
         return self._vad_speaking or (time.monotonic() - self._last_vad_stop) < self._grace_secs
@@ -473,17 +499,253 @@ class PhantomSpeechFilter(FrameProcessor):
                 logger.debug(f"Dropped phantom transcript (no foreground voice detected): {text!r}")
                 return
             conf = _deepgram_confidence(frame)
-            # Require higher confidence for tiny 1-2 character noise fragments
-            req_conf = max(self._min_confidence, 0.78) if len(text) <= 2 else self._min_confidence
+            # Require higher confidence for tiny 1-2 character noise fragments, but not for the short
+            # answers callers actually give („კი“, „ჰო“): dropping one leaves the bot silent
+            tiny_fragment = len(text) <= 2 and not all(w in _COMPLETE_SHORT_REPLIES for w in _plain_words(text))
+            req_conf = max(self._min_confidence, 0.78) if tiny_fragment else self._min_confidence
             if conf is not None and conf < req_conf:
                 logger.debug(f"Dropped low-confidence transcript ({conf:.2f} < {req_conf:.2f}): {text!r}")
                 return
             if isinstance(frame, TranscriptionFrame):
-                from_finalize = bool(getattr(getattr(frame, "result", None), "from_finalize", False))
-                if from_finalize or not self._vad_speaking:
-                    frame.finalized = True
+                if self._repeats_previous_final(frame):
+                    logger.debug(f"Dropped repeated tail word from Deepgram's flush: {text!r}")
+                    return
+                result = getattr(frame, "result", None)
+                self._last_final_words = _plain_words(text)
+                self._last_final_end = float(getattr(result, "start", 0.0) or 0.0) + float(
+                    getattr(result, "duration", 0.0) or 0.0
+                )
 
         await self.push_frame(frame, direction)
+
+    def _repeats_previous_final(self, frame: TranscriptionFrame) -> bool:
+        """Deepgram sometimes re-transcribes the last ~0.2 s of audio as the word the previous final
+        already ended on („…თვეა წელიწადში?“ then „წელიწადში.“), in its answer to a Finalize or in a
+        regular final (a live call got „სანაპიროზე.“ three times)."""
+        result = getattr(frame, "result", None)
+        if not self._last_final_words:
+            return False
+        start = float(getattr(result, "start", 0.0) or 0.0)
+        duration = float(getattr(result, "duration", 0.0) or 0.0)
+        if duration > 0.5 or abs(start - self._last_final_end) > 0.1:
+            return False
+        words = _plain_words(frame.text)
+        return bool(words) and self._last_final_words[-len(words):] == words
+
+
+@dataclass
+class STTFlushedFrame(ControlFrame):
+    """Deepgram has answered a Finalize: every word spoken before the last VAD stop is transcribed.
+
+    A control frame, not a system frame, so it reaches the turn strategy after the transcript it follows.
+    Uninterruptible: the caller's barge-in clears queued frames, and losing this one made the turn
+    wait the full flush timeout.
+    """
+
+    interruptible: bool = field(default=False, init=False)
+
+
+class FlushReportingDeepgramSTTService(DeepgramSTTService):
+    """Deepgram STT that reports when its answer to a Finalize request (sent on each VAD stop) arrives.
+
+    Deepgram sends the last words of an utterance in that answer, 0.1-0.4 s after VAD stops. A turn
+    that ended before it lost them: on live calls „ამ ბავშვებისთვის შეიძლება ამ ფილმის ყურება?“
+    reached the LLM as „ბავშვებისთვის“. The answer can also be empty, which pipecat doesn't
+    forward, so this frame is pushed either way.
+    """
+
+    async def _on_message(self, message):
+        await super()._on_message(message)
+        if isinstance(message, ListenV1Results) and message.is_final and getattr(message, "from_finalize", False):
+            await self.push_frame(STTFlushedFrame())
+
+
+# Words a Georgian sentence doesn't end on: conjunctions, demonstratives and possessives waiting for
+# their noun („…ფილმი მინდა რომ“, „კომპანიას ჰქვია ეგ“)
+_CONTINUATION_WORDS = frozenset(
+    "და რომ თუ მაგრამ ან ანუ რადგან იმიტომ როცა როდესაც როგორც სანამ ხოლო თან ოღონდ მერე მერედა "
+    "ჯერ აი ეს ის ეგ ამ იმ მაგ ჩემი ჩემს შენი თქვენი რაღაც რაღაცა ერთი ძალიან უფრო ყველაზე "
+    "მე შენ ჩვენ თქვენ მინდა მაინტერესებს მითხარი მითხარით მომიყევი მომიყევით".split()
+)
+# One-word turns that are a complete reply on their own
+_COMPLETE_SHORT_REPLIES = frozenset(
+    "კი ჰო ხო დიახ ჰოდა არა არ კარგი კარგით კაი კარგად მადლობა გმადლობთ გაიხარე ნახვამდის "
+    "გასაგებია გავიგე ზუსტად სწორია ალო გისმენთ მესმის ვერა ვერ".split()
+)
+# How long past the base timeout to keep listening, by how finished the caller's words sound
+_EXTRA_WAIT_UNPUNCTUATED_SECS = 0.25
+# Deepgram often ends a finished Georgian question with a comma („…რომელ ხაზზეა,“), so a comma
+# alone gets a shorter wait than a conjunction does
+_EXTRA_WAIT_COMMA_SECS = 0.6
+_EXTRA_WAIT_ONE_WORD_SECS = 0.9
+_EXTRA_WAIT_DANGLING_SECS = 1.2
+
+
+def utterance_end_wait(text: str) -> float:
+    """Extra silence (seconds) to wait before ending a turn whose transcript is ``text``.
+
+    Older callers pause mid-sentence, and Deepgram puts final punctuation only on words that sound
+    finished, so a turn that ends without it, on a lone word, or on a comma or conjunction is usually
+    a pause, not the end. On live calls „მითხარი, … როგორ მოვუარო, … ჩემი ყვავილი დაჭკნა“ reached
+    the LLM as three questions.
+    """
+    text = text.strip()
+    if not text:
+        return 0.0
+    trailing_off = text.endswith(("...", "…"))
+    if text[-1] in ".?!" and not trailing_off:
+        return 0.0
+    words = _plain_words(text)
+    if not words:
+        return 0.0
+    if words[-1] in _CONTINUATION_WORDS:
+        return _EXTRA_WAIT_DANGLING_SECS
+    if trailing_off or text[-1] in ",;:-–—":
+        return _EXTRA_WAIT_COMMA_SECS
+    if len(words) == 1:
+        return 0.0 if words[0] in _COMPLETE_SHORT_REPLIES else _EXTRA_WAIT_ONE_WORD_SECS
+    if all(w in _COMPLETE_SHORT_REPLIES for w in words):
+        return 0.0
+    return _EXTRA_WAIT_UNPUNCTUATED_SECS
+
+
+class CompleteUtteranceUserTurnStopStrategy(BaseUserTurnStopStrategy):
+    """Ends the user turn once Deepgram has flushed the last words and the sentence sounds finished.
+
+    After VAD stops: waits for Deepgram's answer to the Finalize (at most ``stt_flush_timeout``), then
+    for ``user_speech_timeout`` plus ``utterance_end_wait(text)``, all counted from the VAD stop. Any
+    VAD start in between cancels the wait and the turn continues.
+    """
+
+    def __init__(self, *, user_speech_timeout: float = 0.15, stt_flush_timeout: float = 1.5, **kwargs):
+        super().__init__(**kwargs)
+        self._user_speech_timeout = user_speech_timeout
+        self._stt_flush_timeout = stt_flush_timeout
+        self._text = ""
+        self._turn_active = False
+        self._vad_speaking = False
+        # monotonic time of the last VAD stop (each one sends Deepgram a Finalize), and of its last answer
+        self._vad_stopped_at: float | None = None
+        self._flushed_at = 0.0
+        self._timer: asyncio.Task | None = None
+
+    async def handle_user_turn_started(self):
+        await super().handle_user_turn_started()
+        self._text = ""
+        self._turn_active = True
+        await self._cancel_timer()
+
+    async def handle_user_turn_stopped(self):
+        await super().handle_user_turn_stopped()
+        self._text = ""
+        self._turn_active = False
+        self._vad_stopped_at = None
+        await self._cancel_timer()
+
+    async def cleanup(self):
+        await self._cancel_timer()
+        await super().cleanup()
+
+    async def process_frame(self, frame: Frame) -> ProcessFrameResult:
+        if isinstance(frame, VADUserStartedSpeakingFrame):
+            self._vad_speaking = True
+            await self._cancel_timer()
+        elif isinstance(frame, VADUserStoppedSpeakingFrame):
+            self._vad_speaking = False
+            self._vad_stopped_at = time.monotonic()
+            await self._schedule()
+        elif isinstance(frame, STTFlushedFrame):
+            self._flushed_at = time.monotonic()
+            await self._schedule()
+        elif isinstance(frame, TranscriptionFrame) and self._turn_active:
+            self._text = f"{self._text} {frame.text}".strip()
+            if not self._vad_speaking and self._vad_stopped_at is None:
+                # Words with no VAD stop this turn (the turn began on them): time the silence from now
+                self._vad_stopped_at = time.monotonic()
+                self._flushed_at = self._vad_stopped_at
+            await self._schedule()
+        return ProcessFrameResult.CONTINUE
+
+    async def _cancel_timer(self):
+        if self._timer:
+            await self.task_manager.cancel_task(self._timer)
+            self._timer = None
+
+    async def _schedule(self):
+        await self._cancel_timer()
+        if not self._turn_active or self._vad_speaking or not self._text or self._vad_stopped_at is None:
+            return
+        flushed = self._flushed_at >= self._vad_stopped_at
+        if flushed:
+            deadline = self._vad_stopped_at + self._user_speech_timeout + utterance_end_wait(self._text)
+        else:
+            deadline = self._vad_stopped_at + self._stt_flush_timeout
+        self._timer = self.task_manager.create_task(self._wait(deadline, flushed), f"{self}::end_of_turn")
+
+    async def _wait(self, deadline: float, flushed: bool):
+        try:
+            await asyncio.sleep(max(0.0, deadline - time.monotonic()))
+        except asyncio.CancelledError:
+            return
+        self._timer = None
+        if not flushed:
+            logger.debug(f"{self}: no Deepgram flush within {self._stt_flush_timeout:.1f}s; ending turn without it")
+            self._flushed_at = time.monotonic()
+            await self._schedule()
+            return
+        await self.trigger_user_turn_stopped()
+
+
+@dataclass
+class BotReplyFrame(SystemFrame):
+    """Upstream note from ``BotReplyTracker``: the bot's reply is being synthesized (``active``) or not."""
+
+    active: bool = False
+
+
+class BotReplyTracker(FrameProcessor):
+    """Tells the turn strategy, upstream, while a reply is still being synthesized.
+
+    The output transport reports "bot stopped speaking" whenever 0.35 s pass without audio, which
+    happens between two sentences of one reply when the next one's audio is late. To the turn
+    strategy the bot then looked idle, and a cough or TV noise in that gap started a user turn and
+    cut the rest of the reply off. Place it right after the TTS service.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._active = False
+        # An LLM response is open (its end frame not yet through), and TTS is synthesizing. The
+        # „ერთი წამით“ filler is a TTS utterance of its own inside an open response, so between it
+        # and the answer only the first is true.
+        self._llm_open = False
+        self._tts_open = False
+
+    async def _update(self):
+        active = self._llm_open or self._tts_open
+        if active != self._active:
+            self._active = active
+            await self.push_frame(BotReplyFrame(active=active), FrameDirection.UPSTREAM)
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+        await self.push_frame(frame, direction)
+        if direction != FrameDirection.DOWNSTREAM:
+            return
+        if isinstance(frame, LLMFullResponseStartFrame):
+            self._llm_open = True
+        elif isinstance(frame, LLMFullResponseEndFrame):
+            self._llm_open = False
+        elif isinstance(frame, TTSStartedFrame):
+            self._tts_open = True
+        elif isinstance(frame, TTSStoppedFrame):
+            # After TTSStoppedFrame all audio is queued, so BotStoppedSpeakingFrame marks the real end
+            self._tts_open = False
+        elif isinstance(frame, InterruptionFrame):
+            self._llm_open = self._tts_open = False
+        else:
+            return
+        await self._update()
 
 
 def build_vad_processor(stop_secs: float = 0.20, min_voice_rms: float = MIN_VOICE_RMS) -> VoiceIsolatedVADProcessor:
@@ -515,13 +777,23 @@ class NoiseSafeUserTurnStartStrategy(BaseUserTurnStartStrategy):
     repeat themselves. So while the bot is busy, the caller barges in only once Deepgram has
     heard words that passed ``PhantomSpeechFilter``: two interim words, or a final transcript
     (a single-word final needs higher confidence, e.g. „კი“ / „არა“).
+
+    While the reply is still being prepared and nothing is playing yet, no echo or speaker noise can
+    be heard, so any recognized word counts: a caller who paused mid-sentence and goes on („მეტრო …
+    ახმეტელის თეატრი რომელ ხაზზეა?“) cancels the half-question's reply, and the LLM answers both parts.
     """
+
+    # A gap between two sentences of one reply never lasts this long (pipecat's TTS stop timeout is 3 s)
+    _REPLY_GAP_MAX_SECS = 3.0
 
     def __init__(self, *, reply_wait_secs: float = 6.0, min_interim_words: int = 2, **kwargs):
         super().__init__(**kwargs)
         self._reply_wait_secs = reply_wait_secs
         self._min_interim_words = min_interim_words
         self._bot_speaking = False
+        self._bot_stopped_at = 0.0
+        # Set by BotReplyTracker while the reply's audio is still being synthesized
+        self._reply_active = False
         self._turn_active = False
         # Set when the user's turn ends and the LLM starts thinking; cleared once the bot speaks.
         # Expires on its own because an empty turn never gets a reply.
@@ -530,9 +802,18 @@ class NoiseSafeUserTurnStartStrategy(BaseUserTurnStartStrategy):
         # reaches it after a VAD start, so a transcript with no VAD start since the turn ended is
         # such a tail, not the caller speaking again, and must not cancel the reply being prepared.
         self._voice_since_turn_end = True
+        # The caller's current speech began before the reply's audio did, so it can't be echo of the
+        # bot: one recognized word is enough to let them finish
+        self._caller_spoke_first = False
+
+    def _bot_audible(self) -> bool:
+        """The bot is playing a reply, or is between two of its sentences."""
+        if self._bot_speaking:
+            return True
+        return self._reply_active and (time.monotonic() - self._bot_stopped_at) < self._REPLY_GAP_MAX_SECS
 
     def _bot_busy(self) -> bool:
-        if self._bot_speaking:
+        if self._bot_audible():
             return True
         since = self._awaiting_reply_since
         return since is not None and (time.monotonic() - since) < self._reply_wait_secs
@@ -541,12 +822,14 @@ class NoiseSafeUserTurnStartStrategy(BaseUserTurnStartStrategy):
         await super().handle_user_turn_started()
         self._turn_active = True
         self._awaiting_reply_since = None
+        self._caller_spoke_first = False
 
     async def handle_user_turn_stopped(self):
         await super().handle_user_turn_stopped()
         self._turn_active = False
         self._awaiting_reply_since = time.monotonic()
         self._voice_since_turn_end = False
+        self._caller_spoke_first = False
 
     async def process_frame(self, frame: Frame) -> ProcessFrameResult:
         if isinstance(frame, BotStartedSpeakingFrame):
@@ -554,9 +837,15 @@ class NoiseSafeUserTurnStartStrategy(BaseUserTurnStartStrategy):
             self._awaiting_reply_since = None
         elif isinstance(frame, BotStoppedSpeakingFrame):
             self._bot_speaking = False
-            self._awaiting_reply_since = None
+            self._bot_stopped_at = time.monotonic()
+            # Still mid-reply (the filler played, the answer hasn't): keep waiting for it as after
+            # the caller's turn, so noise can't start a turn that cancels it
+            self._awaiting_reply_since = time.monotonic() if self._reply_active else None
+        elif isinstance(frame, BotReplyFrame):
+            self._reply_active = frame.active
         elif isinstance(frame, VADUserStartedSpeakingFrame):
             self._voice_since_turn_end = True
+            self._caller_spoke_first = not self._bot_audible()
             if not self._bot_busy():
                 await self.trigger_user_turn_started()
                 return ProcessFrameResult.STOP
@@ -577,6 +866,8 @@ class NoiseSafeUserTurnStartStrategy(BaseUserTurnStartStrategy):
             return True
         if not self._voice_since_turn_end:
             return False
+        if not self._bot_audible() or self._caller_spoke_first:
+            return True
         if isinstance(frame, InterimTranscriptionFrame):
             return words >= self._min_interim_words
         if words >= 2:
@@ -585,12 +876,18 @@ class NoiseSafeUserTurnStartStrategy(BaseUserTurnStartStrategy):
         return conf is None or conf >= BARGE_IN_MIN_CONFIDENCE
 
 
-def build_user_params(user_speech_timeout: float = 0.20, mute_strategies=None) -> LLMUserAggregatorParams:
-    """Aggregator params: noise-safe turn start (VAD when idle, words to barge in), fast silence-timeout turn end."""
+def build_user_params(user_speech_timeout: float = 0.15, mute_strategies=None) -> LLMUserAggregatorParams:
+    """Aggregator params: noise-safe turn start (VAD when idle, words to barge in), and a turn end that
+    waits for Deepgram's last words and for the sentence to sound finished.
+
+    MUTE_USER_WHILE_BOT_SPEAKS=true ignores the caller while the bot talks (no barge-in), on every
+    entry point."""
+    if mute_strategies is None and os.getenv("MUTE_USER_WHILE_BOT_SPEAKS", "false").strip().lower() == "true":
+        mute_strategies = [AlwaysUserMuteStrategy()]
     return LLMUserAggregatorParams(
         user_turn_strategies=UserTurnStrategies(
             start=[NoiseSafeUserTurnStartStrategy()],
-            stop=[SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=user_speech_timeout)],
+            stop=[CompleteUtteranceUserTurnStopStrategy(user_speech_timeout=user_speech_timeout)],
         ),
         user_mute_strategies=mute_strategies or [],
     )

@@ -98,6 +98,8 @@ _LATIN_TO_GEORGIAN_PHONETICS = {
     r"\bGoogle\b": "გუგლი",
     r"\bYouTube\b": "იუთუბი",
     r"\bSIM\b": "სიმ",
+    r"\bOK\b": "ოკეი",
+    r"\bE-?mail\b": "იმეილი",
     r"₾": " ლარი",
     r"\$": " დოლარი",
     r"%": " პროცენტი",
@@ -112,14 +114,95 @@ _MARKUP = re.compile(r"<[^<>]{1,40}>|\*{1,3}|_{2,}|`+|^\s*#{1,6}\s*", re.MULTILI
 _LATIN_IN_GEORGIAN_WORD = re.compile(r"(?<=[ა-ჰ])[A-Za-z]+|[A-Za-z]+(?=[ა-ჰ])")
 
 
+_GEORGIAN_DIGITS = ("ნული", "ერთი", "ორი", "სამი", "ოთხი", "ხუთი", "ექვსი", "შვიდი", "რვა", "ცხრა")
+_VIGESIMAL_COMPOUND = re.compile(r"^((?:ორმოც|სამოც|ოთხმოც|ოც)და)(.+)$")
+_VOWELS = "აეიოუ"
+# Bank and operator short codes: *0303
+_STAR_CODE = re.compile(r"\*(\d{3,6})(?:-([ა-ჰ]+))?\b")
+# A run of at least 7 digits, optionally grouped by spaces or dashes and led by „+“: a phone number,
+# unless a currency follows (then it's an amount written with thousands spaces)
+_PHONE = re.compile(r"(?<![\d.,])\+?\d(?:[ \-]?\d){6,}(?![\d.,])(?!\s*(?:ლარ|დოლარ|ევრო|თეთრ))")
+# A time, with a case ending („10:30-ზე“) or followed by the word საათი itself („10:00 საათზე“)
+_TIME = re.compile(r"\b([01]?\d|2[0-3]):([0-5]\d)(?:-([ა-ჰ]+)|\s+საათ([ა-ჰ]*))?\b")
+_DECIMAL = re.compile(r"\b(\d+)[.,](\d{1,2})(?:-([ა-ჰ]+))?\b")
+_THOUSANDS = re.compile(r"\b\d{1,3}(?:[ ,]\d{3})+\b")
+
+
+def _attributive(word: str) -> str:
+    """Numeral before a noun in an oblique case: 'ათი' -> 'ათ' („ათ საათზე“); 'რვა' stays."""
+    return word[:-1] if word.endswith("ი") else word
+
+
+def _number_with_suffix(word: str, suffix: str) -> str:
+    """Attaches a case ending written after a hyphen: ხუთი + ზე -> ხუთზე, + დან -> ხუთიდან,
+    + მდე -> ხუთამდე, + იან -> ხუთიან; რვა + დან -> რვიდან, + ზე -> რვაზე."""
+    last = word[-1]
+    stem = word[:-1] if last in "ია" else word
+    if suffix[0] in _VOWELS:
+        return stem + suffix
+    if suffix == "დან":
+        return stem + "იდან"
+    if suffix == "თვის":
+        return stem + "ისთვის"
+    if suffix == "მდე":
+        return (stem + "ამდე") if last == "ი" else (word + "მდე")
+    return (stem if last == "ი" else word) + suffix
+
+
+def _ordinal(n: int) -> str:
+    """მე-5 -> მეხუთე, მე-21 -> ოცდამეერთე, 1-ლი -> პირველი."""
+    if n == 1:
+        return "პირველი"
+    words = number_to_georgian(n).split(" ")
+    m = _VIGESIMAL_COMPOUND.match(words[-1])
+    prefix, unit = (m.group(1), m.group(2)) if m else ("", words[-1])
+    words[-1] = prefix + "მე" + (unit[:-1] if unit[-1] in "ია" else unit) + "ე"
+    return " ".join(words)
+
+
+def _digit_group(group: str) -> str:
+    """One group of a phone number: leading zeros are spoken („032“ -> „ნული ოცდათორმეტი“)."""
+    zeros = len(group) - len(group.lstrip("0"))
+    rest = group[zeros:]
+    return " ".join(["ნული"] * zeros + ([number_to_georgian(int(rest))] if rest else []))
+
+
+def _phone_number(text: str) -> str:
+    """Reads a phone number the way Georgians dictate it, in groups with pauses:
+    „599 12 34 56“ -> „ხუთას ოთხმოცდაცხრამეტი, თორმეტი, ოცდათოთხმეტი, ორმოცდათექვსმეტი“."""
+    plus = text.startswith("+")
+    groups = [g for g in re.split(r"[ \-]", text.lstrip("+")) if g]
+    spoken = []
+    for g in groups:
+        if len(g) <= 3:
+            spoken.append(g)
+            continue
+        # An ungrouped run: three digits, then pairs („599123456“ -> 599 12 34 56)
+        head = 3 if len(g) > 4 else 2
+        spoken.append(g[:head])
+        rest = g[head:]
+        spoken.extend(rest[i : i + 2] for i in range(0, len(rest), 2))
+    return ("პლიუს " if plus else "") + ", ".join(_digit_group(g) for g in spoken)
+
+
 def normalize_georgian_text(text: str) -> str:
     """
     Normalizes text for natural, native Georgian neural TTS:
     - Replaces English/Latin tech terms with natural Georgian phonetics.
-    - Converts digits with Georgian suffixes (e.g., '112-ზე' -> 'ას თორმეტზე').
+    - Reads phone numbers and short codes in dictation groups, times, decimals and ordinals.
+    - Converts digits with Georgian suffixes (e.g., '112-ზე' -> 'ას თორმეტზე', '5-დან' -> 'ხუთიდან').
     - Converts numbers (up to hundreds of billions) to full Georgian words.
     - Expands currency and percentage symbols.
     """
+    # Star codes first: the markup step below would strip the „*“
+    def replace_star_code(m):
+        digits = [_GEORGIAN_DIGITS[int(d)] for d in m.group(1)]
+        if m.group(2):
+            digits[-1] = _number_with_suffix(digits[-1], m.group(2))
+        return "ვარსკვლავი, " + " ".join(digits)
+
+    text = _STAR_CODE.sub(replace_star_code, text)
+
     # 0. Drop markup the LLM sometimes emits (<h2>, **bold**, # headings), which TTS would spell out
     text = _MARKUP.sub(" ", text)
 
@@ -128,24 +211,46 @@ def normalize_georgian_text(text: str) -> str:
         text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
     text = _LATIN_IN_GEORGIAN_WORD.sub(lambda m: m.group(0).lower().translate(_LATIN_LETTER_TO_GEORGIAN), text)
 
-    # 2. Convert hyphenated number-suffix combinations (e.g. 112-ზე, 5-ში, 25-ს)
-    def replace_num_suffix(m):
-        num = int(m.group(1))
-        suffix = m.group(2)
-        word = number_to_georgian(num)
-        if word.endswith("ი") and suffix in ["ზე", "ში", "ს", "ით", "ად", "დან", "მდე"]:
-            word = word[:-1]
-        return word + suffix
+    # 2. Phone numbers, times, decimals, thousands separators and ordinals, before plain numbers
+    text = _PHONE.sub(lambda m: _phone_number(m.group(0)), text)
 
-    text = re.sub(r"\b(\d+)-([ა-ჰ]+)\b", replace_num_suffix, text)
+    def replace_time(m):
+        hour, minute, suffix = number_to_georgian(int(m.group(1))), int(m.group(2)), m.group(3)
+        if m.group(4) is not None:
+            # „10:00 საათზე“: the ending is on the following საათ- word, which this replaces
+            suffix = None if m.group(4) in ("", "ი") else m.group(4)
+        if not minute:
+            return f"{_attributive(hour)} {_number_with_suffix('საათი', suffix)}" if suffix else f"{hour} საათი"
+        minutes = number_to_georgian(minute)
+        if suffix in ("ა", "ია"):
+            # Copula („10:15-ია“): the numbers stay in the nominative, „ათი საათი და თხუთმეტი წუთია“
+            return f"{hour} საათი და {minutes} {_number_with_suffix('წუთი', suffix)}"
+        if suffix:
+            return f"{_attributive(hour)} საათსა და {_attributive(minutes)} {_number_with_suffix('წუთი', suffix)}"
+        return f"{hour} საათი და {minutes} წუთი"
 
-    # 3. Convert standalone numbers
-    def replace_num(m):
-        num = int(m.group(1))
-        return number_to_georgian(num)
+    text = _TIME.sub(replace_time, text)
 
-    text = re.sub(r"\b(\d+)\b", replace_num, text)
-    return text
+    def replace_decimal(m):
+        whole, frac, suffix = number_to_georgian(int(m.group(1))), m.group(2), m.group(3)
+        spoken = (_attributive(whole) + "ნახევარი") if frac == "5" else f"{whole} მთელი {_digit_group(frac)}"
+        return _number_with_suffix(spoken, suffix) if suffix else spoken
+
+    text = _DECIMAL.sub(replace_decimal, text)
+    text = _THOUSANDS.sub(lambda m: re.sub(r"[ ,]", "", m.group(0)), text)
+    text = re.sub(r"\bმე-(\d+)(?:-ე)?\b", lambda m: _ordinal(int(m.group(1))), text)
+    text = re.sub(r"\b1-ლი\b", "პირველი", text)
+
+    # 3. Convert hyphenated number-suffix combinations (e.g. 112-ზე, 5-ში, 25-ს)
+    text = re.sub(
+        r"\b(\d+)-([ა-ჰ]+)\b",
+        lambda m: _number_with_suffix(number_to_georgian(int(m.group(1))), m.group(2)),
+        text,
+    )
+
+    # 4. Convert standalone numbers
+    text = re.sub(r"\b(\d+)\b", lambda m: number_to_georgian(int(m.group(1))), text)
+    return re.sub(r"[ \t]{2,}", " ", text)
 
 
 class EdgeTTSService(TTSService):

@@ -10,6 +10,7 @@ import math
 import os
 import random
 import re
+import signal
 import socket
 import struct
 import sys
@@ -46,14 +47,14 @@ from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
-from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.transports.base_input import BaseInputTransport
 from pipecat.transports.base_output import BaseOutputTransport
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 
-from bot import build_llm, build_tts
+from bot import DEFAULT_EDGE_TTS_RATE, build_llm, build_stt, build_tts
 from prompts import INITIAL_GREETING
 from speech_gate import (
+    BotReplyTracker,
     PhantomSpeechFilter,
     SpeechOnlyAudioGate,
     build_user_params,
@@ -88,7 +89,7 @@ def warm_greeting_cache() -> Optional[bytes]:
         from edge_tts_service import normalize_georgian_text
 
         voice = os.getenv("EDGE_TTS_VOICE", "ka-GE-EkaNeural").strip()
-        rate = os.getenv("EDGE_TTS_RATE", "+12%").strip()
+        rate = os.getenv("EDGE_TTS_RATE", DEFAULT_EDGE_TTS_RATE).strip()
         pitch = os.getenv("EDGE_TTS_PITCH", "+0Hz").strip()
         clean_text = normalize_georgian_text(INITIAL_GREETING.strip())
 
@@ -419,6 +420,8 @@ class PhoneCall:
         self.acked = False
         self.active = True
         self.started_at = time.monotonic()
+        # When the 200 OK was last (re)sent, until the caller's ACK arrives
+        self.ok_sent_at = time.monotonic()
         self.recorded_pcm: Optional[bytearray] = bytearray() if RECORD_CALLS else None
 
     def hangup(self):
@@ -479,6 +482,10 @@ class VoIPAudioOutput(BaseOutputTransport):
         if isinstance(frame, InterruptionFrame):
             self._call.rtp.clear_output()
         await super().process_frame(frame, direction)
+        if isinstance(frame, InterruptionFrame):
+            # While pipecat was cancelling, a pending write_audio_frame could still queue a chunk or
+            # two of the interrupted reply; drop them so the caller doesn't hear a blip of it
+            self._call.rtp.clear_output()
 
     async def write_audio_frame(self, frame: OutputAudioRawFrame) -> bool:
         if not self._call.active:
@@ -554,6 +561,23 @@ def save_recording(call: PhoneCall):
 
 
 async def handle_call_session(call: PhoneCall):
+    try:
+        await _run_call_session(call)
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        # Includes failures building the pipeline (bad config, model load): the call is already
+        # answered, so without the hangup below the caller would sit on dead air
+        logger.exception("Error during phone call session")
+    finally:
+        # Sends BYE only if the caller hasn't already hung up, so the line never stays open on dead air
+        call.hangup()
+        call.sip_server.calls.pop(call.call_id, None)
+        if call.recorded_pcm:
+            save_recording(call)
+
+
+async def _run_call_session(call: PhoneCall):
     print("\n" + "=" * 65)
     print("📞 შემომავალი ზარი მიღებულია! (Incoming Call Answered)")
     print(f"   დამრეკი (Caller): {call.caller_number}")
@@ -570,14 +594,7 @@ async def handle_call_session(call: PhoneCall):
     transport = VoIPTransport(call, transport_params)
 
     vad = build_vad_processor()
-    stt = DeepgramSTTService(
-        api_key=os.getenv("DEEPGRAM_API_KEY"),
-        settings=DeepgramSTTService.Settings(
-            model=os.getenv("DEEPGRAM_MODEL", "nova-3"),
-            language="ka",
-            smart_format=True,
-        ),
-    )
+    stt = build_stt()
     phantom_filter = PhantomSpeechFilter()
     llm = build_llm()
     tts = build_tts(sample_rate=PHONE_SAMPLE_RATE)
@@ -600,6 +617,7 @@ async def handle_call_session(call: PhoneCall):
             llm,
             BotDisplay(),
             tts,
+            BotReplyTracker(),
             transport.output(),
             context_aggregator.assistant(),
         ]
@@ -655,16 +673,7 @@ async def handle_call_session(call: PhoneCall):
 
     try:
         await runner.run(task)
-    except asyncio.CancelledError:
-        pass
-    except Exception as e:
-        logger.error(f"Error during phone call session: {e}")
     finally:
-        # Sends BYE only if the caller hasn't already hung up, so the line never stays open on dead air
-        call.hangup()
-        call.sip_server.calls.pop(call.call_id, None)
-        if call.recorded_pcm:
-            save_recording(call)
         for t in (greet_task, monitor_task):
             if not t.done():
                 t.cancel()
@@ -846,15 +855,20 @@ class MyPhoneSIPServer:
         m = re.search(r"sip:([^@>;]+)", from_h)
         return m.group(1) if m else from_h
 
-    def _parse_sdp(self, req: str) -> Tuple[str, int, int]:
-        """Extracts (remote_rtp_ip, remote_rtp_port, preferred_codec_pt) from INVITE SDP."""
+    def _parse_sdp(self, req: str) -> Tuple[str, int, int, bool]:
+        """Extracts (remote_rtp_ip, remote_rtp_port, preferred_codec_pt, has_media) from INVITE SDP.
+
+        has_media is False when the INVITE carries no usable audio line (a delayed-offer re-INVITE);
+        the returned address is then only a default and must not replace a call's real one.
+        """
         remote_ip = self.server
         remote_port = 10000
         codec_pt = 0  # Default PCMU
+        has_media = False
 
         parts = req.split("\r\n\r\n", 1)
         if len(parts) < 2:
-            return remote_ip, remote_port, codec_pt
+            return remote_ip, remote_port, codec_pt, has_media
 
         sdp = parts[1]
         for line in sdp.split("\r\n"):
@@ -862,14 +876,34 @@ class MyPhoneSIPServer:
                 remote_ip = line.split("c=IN IP4 ", 1)[1].split("/")[0].strip()
             elif line.startswith("m=audio "):
                 tokens = line.split()
-                if len(tokens) >= 4:
-                    remote_port = int(tokens[1].split("/")[0])
+                port = tokens[1].split("/")[0] if len(tokens) >= 4 else ""
+                if port.isdigit():
+                    remote_port = int(port)
+                    has_media = True
                     offered_pts = [int(x) for x in tokens[3:] if x.isdigit()]
                     for pt in offered_pts:
                         if pt in (0, 8):
                             codec_pt = pt
                             break
-        return remote_ip, remote_port, codec_pt
+        return remote_ip, remote_port, codec_pt, has_media
+
+    def _reply_error(self, req: str, status: str, local_tag: str):
+        """Final error response to an INVITE, so the caller hears a failure instead of endless ringing."""
+        vias = "\r\n".join(sip_get_all_headers(req, "Via", "v"))
+        to_h = sip_get_header(req, "To", "t")
+        if ";tag=" not in to_h:
+            to_h = f"{to_h};tag={local_tag}"
+        resp = (
+            f"SIP/2.0 {status}\r\n"
+            f"{vias}\r\n"
+            f"From: {sip_get_header(req, 'From', 'f')}\r\n"
+            f"To: {to_h}\r\n"
+            f"Call-ID: {sip_get_header(req, 'Call-ID', 'i')}\r\n"
+            f"CSeq: {sip_get_header(req, 'CSeq')}\r\n"
+            "User-Agent: GeorgianVoiceAI/2.0\r\n"
+            "Content-Length: 0\r\n\r\n"
+        )
+        self.sock.sendto(resp.encode("utf-8"), (self.server, self.port))
 
     def _build_invite_ok(self, req: str, local_tag: str, local_rtp_port: int, codec_pt: int) -> str:
         vias = "\r\n".join(sip_get_all_headers(req, "Via", "v"))
@@ -925,12 +959,13 @@ class MyPhoneSIPServer:
         if not call_id:
             return
 
-        remote_ip, remote_port, codec_pt = self._parse_sdp(req)
+        remote_ip, remote_port, codec_pt, has_media = self._parse_sdp(req)
 
         # If this Call-ID already exists (retransmitted INVITE or session-timer re-INVITE):
-        if call_id in self.calls and self.calls[call_id].active:
-            call = self.calls[call_id]
-            call.rtp.remote_addr = (remote_ip, remote_port)
+        call = self.calls.get(call_id)
+        if call is not None and call.active:
+            if has_media:
+                call.rtp.remote_addr = (remote_ip, remote_port)
             call.ok_response = self._build_invite_ok(req, call.local_tag, call.rtp.local_port, call.rtp.codec_pt)
             self.sock.sendto(call.ok_response.encode("utf-8"), (self.server, self.port))
             return
@@ -964,14 +999,24 @@ class MyPhoneSIPServer:
         self.sock.sendto(trying.encode("utf-8"), (self.server, self.port))
         self.sock.sendto(ringing.encode("utf-8"), (self.server, self.port))
 
-        # 2. Start RTP session & send 200 OK with SDP
-        local_rtp_port = self._allocate_rtp_port()
-        rtp = RTPSession(
-            local_ip=self.local_ip,
-            local_port=local_rtp_port,
-            remote_addr=(remote_ip, remote_port),
-            codec_pt=codec_pt,
-        )
+        # 2. Start RTP session & send 200 OK with SDP. A port another app holds fails to bind, so
+        # try a few before giving up with an error the caller's phone can show.
+        rtp = None
+        for _ in range(5):
+            local_rtp_port = self._allocate_rtp_port()
+            try:
+                rtp = RTPSession(
+                    local_ip=self.local_ip,
+                    local_port=local_rtp_port,
+                    remote_addr=(remote_ip, remote_port),
+                    codec_pt=codec_pt,
+                )
+                break
+            except OSError as e:
+                logger.warning(f"RTP port {local_rtp_port} unavailable ({e}); trying another")
+        if rtp is None:
+            self._reply_error(req, "500 Server Internal Error", local_tag)
+            return
         rtp.start()
 
         ok_resp = self._build_invite_ok(req, local_tag, local_rtp_port, codec_pt)
@@ -1032,7 +1077,8 @@ class MyPhoneSIPServer:
 
             # 2. Retransmit 200 OK for any un-ACKed answered calls (every 0.5s up to 4s)
             for call in list(self.calls.values()):
-                if call.active and not call.acked and (now - call.started_at) < 4.0:
+                if call.active and not call.acked and (now - call.started_at) < 4.0 and now - call.ok_sent_at >= 0.5:
+                    call.ok_sent_at = now
                     try:
                         self.sock.sendto(call.ok_response.encode("utf-8"), (self.server, self.port))
                     except Exception:
@@ -1065,39 +1111,47 @@ class MyPhoneSIPServer:
                 continue
 
             msg = data.decode("utf-8", errors="replace")
-            first_line = msg.split("\r\n", 1)[0].strip()
+            try:
+                self._handle_message(msg)
+            except Exception:
+                # An uncaught error here would end this thread: REGISTER refreshes would stop and
+                # every later call would fail, with nothing logged
+                logger.exception(f"Error handling SIP message: {msg.splitlines()[0] if msg else ''!r}")
 
-            if first_line.startswith("SIP/2.0 "):
-                # SIP Response
-                cseq = sip_get_header(msg, "CSeq")
-                if "REGISTER" in cseq:
-                    if "401 " in first_line or "407 " in first_line:
-                        self._handle_register_401(msg)
-                    elif "200 " in first_line:
-                        exp_hdr = sip_get_header(msg, "Expires")
-                        if exp_hdr.isdigit():
-                            self.reg_expires = int(exp_hdr)
-                        self.last_reg_ok = time.monotonic()
-                        self.registered.set()
-            else:
-                # SIP Request from server
-                method = first_line.split(" ", 1)[0].upper()
-                if method in ("OPTIONS", "NOTIFY", "INFO", "MESSAGE", "UPDATE"):
-                    self._reply_simple_ok(msg)
-                elif method == "INVITE":
-                    self._handle_invite(msg)
-                elif method == "ACK":
-                    call_id = sip_get_header(msg, "Call-ID", "i")
-                    if call_id in self.calls:
-                        self.calls[call_id].acked = True
-                elif method in ("BYE", "CANCEL"):
-                    self._reply_simple_ok(msg)
-                    call_id = sip_get_header(msg, "Call-ID", "i")
-                    if call_id in self.calls:
-                        call = self.calls[call_id]
-                        call.active = False
-                        call.rtp.stop()
+    def _handle_message(self, msg: str):
+        first_line = msg.split("\r\n", 1)[0].strip()
 
+        if first_line.startswith("SIP/2.0 "):
+            # SIP Response
+            cseq = sip_get_header(msg, "CSeq")
+            if "REGISTER" in cseq:
+                if "401 " in first_line or "407 " in first_line:
+                    self._handle_register_401(msg)
+                elif "200 " in first_line:
+                    exp_hdr = sip_get_header(msg, "Expires")
+                    if exp_hdr.isdigit():
+                        self.reg_expires = int(exp_hdr)
+                    self.last_reg_ok = time.monotonic()
+                    self.registered.set()
+            return
+
+        # SIP Request from server. The call-session thread removes ended calls from self.calls,
+        # so look calls up once with .get() instead of checking and then indexing.
+        method = first_line.split(" ", 1)[0].upper()
+        if method in ("OPTIONS", "NOTIFY", "INFO", "MESSAGE", "UPDATE"):
+            self._reply_simple_ok(msg)
+        elif method == "INVITE":
+            self._handle_invite(msg)
+        elif method == "ACK":
+            call = self.calls.get(sip_get_header(msg, "Call-ID", "i"))
+            if call is not None:
+                call.acked = True
+        elif method in ("BYE", "CANCEL"):
+            self._reply_simple_ok(msg)
+            call = self.calls.get(sip_get_header(msg, "Call-ID", "i"))
+            if call is not None:
+                call.active = False
+                call.rtp.stop()
 
 def on_incoming_call(call: PhoneCall):
     def _run():
@@ -1138,6 +1192,8 @@ def main():
     print("=" * 65)
     print("  🚀 სტატუსი: რეგისტრაცია და ხმის მომზადება... (Registering & warming voice...)")
     warm_greeting_cache()
+    # Pay the one-time Gemini client setup (TLS context, imports) now rather than in the first call
+    build_llm()
 
     sip_server = MyPhoneSIPServer(
         server=server,
@@ -1149,6 +1205,10 @@ def main():
         on_call=on_incoming_call,
     )
     sip_server.start()
+
+    # `docker stop` and systemd send SIGTERM: exit through the finally below so the
+    # registration is removed and MyPhone stops routing calls to this server
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
 
     announced_reg = False
     if sip_server.registered.wait(timeout=8.0):

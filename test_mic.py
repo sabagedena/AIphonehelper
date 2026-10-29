@@ -29,15 +29,14 @@ from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
-from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.transports.local.audio import (
     LocalAudioTransport,
     LocalAudioTransportParams,
 )
 
-from bot import build_llm, build_tts
+from bot import build_llm, build_stt, build_tts
 from prompts import GEORGIAN_PROMPT, INITIAL_GREETING
-from speech_gate import PhantomSpeechFilter, SpeechOnlyAudioGate, build_user_params, build_vad_processor
+from speech_gate import BotReplyTracker, PhantomSpeechFilter, SpeechOnlyAudioGate, build_user_params, build_vad_processor
 
 load_dotenv()
 
@@ -186,14 +185,7 @@ async def main():
     vad = build_vad_processor()
 
     # 1. Listen (Deepgram Georgian)
-    stt = DeepgramSTTService(
-        api_key=os.getenv("DEEPGRAM_API_KEY"),
-        settings=DeepgramSTTService.Settings(
-            model=os.getenv("DEEPGRAM_MODEL", "nova-3"),
-            language="ka",
-            smart_format=True,
-        ),
-    )
+    stt = build_stt()
 
     # 1b. Drop transcripts Deepgram invents from silence/noise
     phantom_filter = PhantomSpeechFilter()
@@ -223,6 +215,7 @@ async def main():
             llm,
             BotDisplay(),
             tts,
+            BotReplyTracker(),
             transport.output(),
             context_aggregator.assistant(),
         ]

@@ -1,4 +1,7 @@
+# Python 3.12 is required: server_phone.py uses audioop, which was removed in 3.13
 FROM python:3.12-slim
+
+ENV PYTHONUNBUFFERED=1
 
 # Install system audio and network utilities
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -19,9 +22,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy project files
 COPY . .
 
-# Expose SIP port and HTTP health check port
+# SIP signaling and the RTP audio port range. Run with host networking
+# (see docker-compose.yml): publishing 10,000 UDP ports through Docker is impractical.
 EXPOSE 5060/udp
-EXPOSE 8000/tcp
+EXPOSE 10000-20000/udp
 
 # Run the Georgian AI telephone server
 CMD ["python", "server_phone.py"]

@@ -476,11 +476,15 @@
                                 initialMsg.remove();
                             }
 
-                            if (data.type === 'transcript_user') {
-                                transcriptBox.innerHTML += `<div class="msg-caller">🗣️ <strong>თქვენ:</strong> ${data.text}</div>`;
-                                transcriptBox.scrollTop = transcriptBox.scrollHeight;
-                            } else if (data.type === 'transcript_bot') {
-                                transcriptBox.innerHTML += `<div class="msg-bot">🤖 <strong>დამხმარე:</strong> ${data.text}</div>`;
+                            if (data.type === 'transcript_user' || data.type === 'transcript_bot') {
+                                // Text nodes, not innerHTML: a „<“ in a transcript must not break the page
+                                const isUser = data.type === 'transcript_user';
+                                const row = document.createElement('div');
+                                row.className = isUser ? 'msg-caller' : 'msg-bot';
+                                const label = document.createElement('strong');
+                                label.textContent = isUser ? 'თქვენ:' : 'დამხმარე:';
+                                row.append(isUser ? '🗣️ ' : '🤖 ', label, ' ' + data.text);
+                                transcriptBox.appendChild(row);
                                 transcriptBox.scrollTop = transcriptBox.scrollHeight;
                             }
                         } catch(e) {
