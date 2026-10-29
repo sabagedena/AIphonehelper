@@ -13,6 +13,8 @@ services:
     volumes:
       # Only used when RECORD_CALLS=true
       - ./recordings:/app/recordings
+      # One text file per call (SAVE_TRANSCRIPTS, on by default); kept across rebuilds
+      - ./transcripts:/app/transcripts
     logging:
       driver: json-file
       options:

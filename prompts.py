@@ -65,7 +65,7 @@ _MONTHS = (
     "ივლისი", "აგვისტო", "სექტემბერი", "ოქტომბერი", "ნოემბერი", "დეკემბერი",
 )
 # Georgia is UTC+4 all year (no daylight saving time)
-_TBILISI_TZ = timezone(timedelta(hours=4))
+TBILISI_TZ = timezone(timedelta(hours=4))
 
 
 def build_system_prompt(now: datetime | None = None) -> str:
@@ -73,7 +73,7 @@ def build_system_prompt(now: datetime | None = None) -> str:
     „რა დღეა დღეს?“ instead of guessing. Build it per call."""
     from edge_tts_service import number_to_georgian
 
-    now = now or datetime.now(_TBILISI_TZ)
+    now = now or datetime.now(TBILISI_TZ)
     minutes = f" და {number_to_georgian(now.minute)} წუთი" if now.minute else ""
     return (
         GEORGIAN_PROMPT

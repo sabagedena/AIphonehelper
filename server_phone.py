@@ -18,6 +18,7 @@ import threading
 import time
 import uuid
 import wave
+from datetime import datetime
 from typing import Callable, Dict, Optional, Tuple
 
 import requests
@@ -52,7 +53,7 @@ from pipecat.transports.base_output import BaseOutputTransport
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 
 from bot import DEFAULT_EDGE_TTS_RATE, build_llm, build_stt, build_tts
-from prompts import INITIAL_GREETING
+from prompts import INITIAL_GREETING, TBILISI_TZ
 from speech_gate import (
     BotReplyTracker,
     PhantomSpeechFilter,
@@ -73,6 +74,40 @@ _GREETING_PCM16_CACHE: Optional[bytes] = None
 # RECORD_CALLS=true saves what the pipeline hears from each caller to recordings/*.wav, for tuning
 # the speech gate on real calls. Off by default: it records callers' voices.
 RECORD_CALLS = os.getenv("RECORD_CALLS", "false").strip().lower() == "true"
+
+# Each call's conversation (caller number, both sides, Tbilisi times) goes to
+# transcripts/<date>_<time>_<caller>.txt as it happens, so it survives a crash mid-call.
+# SAVE_TRANSCRIPTS=false turns it off: callers' numbers and words are personal data.
+SAVE_TRANSCRIPTS = os.getenv("SAVE_TRANSCRIPTS", "true").strip().lower() == "true"
+TRANSCRIPTS_DIR = "transcripts"
+
+
+class CallTranscript:
+    """Appends one call's conversation to its own text file, a line per utterance."""
+
+    def __init__(self, caller_number: str):
+        self._started = datetime.now(TBILISI_TZ)
+        caller = re.sub(r"[^0-9A-Za-z+]", "", caller_number) or "unknown"
+        self.path = os.path.join(TRANSCRIPTS_DIR, f"{self._started:%Y-%m-%d_%H-%M-%S}_{caller}.txt")
+        self._write(f"დამრეკი: {caller_number}\nდაიწყო:  {self._started:%Y-%m-%d %H:%M:%S} (თბილისის დროით)\n\n")
+
+    def add(self, speaker: str, text: str):
+        self._write(f"[{datetime.now(TBILISI_TZ):%H:%M:%S}] {speaker}: {text}\n")
+
+    def close(self):
+        ended = datetime.now(TBILISI_TZ)
+        mins, secs = divmod(int((ended - self._started).total_seconds()), 60)
+        self._write(f"\nდასრულდა: {ended:%Y-%m-%d %H:%M:%S} (ხანგრძლივობა: {mins} წთ {secs} წმ)\n")
+        print(f"📝 ზარის ტექსტი: {self.path}")
+
+    def _write(self, text: str):
+        # A few bytes per utterance, so a plain append; a full disk must never break the call
+        try:
+            os.makedirs(TRANSCRIPTS_DIR, exist_ok=True)
+            with open(self.path, "a", encoding="utf-8") as f:
+                f.write(text)
+        except OSError as e:
+            logger.warning(f"Could not write call transcript {self.path}: {e}")
 
 
 def warm_greeting_cache() -> Optional[bytes]:
@@ -512,6 +547,10 @@ class VoIPTransport(BaseTransport):
 
 
 class UserDisplay(FrameProcessor):
+    def __init__(self, transcript: Optional[CallTranscript] = None):
+        super().__init__()
+        self._transcript = transcript
+
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
         if isinstance(frame, BotStartedSpeakingFrame):
@@ -524,13 +563,20 @@ class UserDisplay(FrameProcessor):
             text = frame.text.strip()
             if text:
                 print(f"\n🗣️  აბონენტი: {text}")
+                if self._transcript:
+                    self._transcript.add("აბონენტი", text)
         await self.push_frame(frame, direction)
 
 
 class BotDisplay(FrameProcessor):
-    def __init__(self):
+    def __init__(self, transcript: Optional[CallTranscript] = None):
         super().__init__()
         self._buf = []
+        self._transcript = transcript
+
+    def _record(self, text: str):
+        if self._transcript:
+            self._transcript.add("დამხმარე", text)
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
@@ -542,9 +588,17 @@ class BotDisplay(FrameProcessor):
             text = "".join(self._buf).strip()
             if text:
                 print(f"🤖  დამხმარე: {text}")
+                self._record(text)
             self._buf = []
+        elif isinstance(frame, TTSSpeakFrame):
+            # The „ერთი წამით“ fillers and similar lines the LLM service speaks outside its reply
+            print(f"🤖  დამხმარე: {frame.text}")
+            self._record(frame.text)
         elif isinstance(frame, InterruptionFrame) and self._buf:
             print("✋ [შეწყვეტილია]")
+            text = "".join(self._buf).strip()
+            if text:
+                self._record(f"{text} (შეაწყვეტინეს)")
             self._buf = []
         await self.push_frame(frame, direction)
 
@@ -561,8 +615,9 @@ def save_recording(call: PhoneCall):
 
 
 async def handle_call_session(call: PhoneCall):
+    transcript = CallTranscript(call.caller_number) if SAVE_TRANSCRIPTS else None
     try:
-        await _run_call_session(call)
+        await _run_call_session(call, transcript)
     except asyncio.CancelledError:
         pass
     except Exception:
@@ -575,9 +630,11 @@ async def handle_call_session(call: PhoneCall):
         call.sip_server.calls.pop(call.call_id, None)
         if call.recorded_pcm:
             save_recording(call)
+        if transcript:
+            transcript.close()
 
 
-async def _run_call_session(call: PhoneCall):
+async def _run_call_session(call: PhoneCall, transcript: Optional[CallTranscript]):
     print("\n" + "=" * 65)
     print("📞 შემომავალი ზარი მიღებულია! (Incoming Call Answered)")
     print(f"   დამრეკი (Caller): {call.caller_number}")
@@ -612,10 +669,10 @@ async def _run_call_session(call: PhoneCall):
             SpeechOnlyAudioGate(),
             stt,
             phantom_filter,
-            UserDisplay(),
+            UserDisplay(transcript),
             context_aggregator.user(),
             llm,
-            BotDisplay(),
+            BotDisplay(transcript),
             tts,
             BotReplyTracker(),
             transport.output(),
@@ -638,8 +695,11 @@ async def _run_call_session(call: PhoneCall):
         await asyncio.sleep(0.3)
         if not call.active:
             return
-        print("\n🤖 დამხმარე: " + INITIAL_GREETING)
         if _GREETING_PCM16_CACHE:
+            # (Without the cache the greeting is a TTSSpeakFrame, which BotDisplay prints and records)
+            print("\n🤖 დამხმარე: " + INITIAL_GREETING)
+            if transcript:
+                transcript.add("დამხმარე", INITIAL_GREETING)
             # Cached audio bypasses the pipeline, so record the greeting in the LLM context
             # ourselves; otherwise the model doesn't know it already said „გამარჯობა“.
             context.add_message({"role": "assistant", "content": INITIAL_GREETING})

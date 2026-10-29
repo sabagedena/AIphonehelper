@@ -75,6 +75,7 @@ git pull && docker compose up -d --build
 - If registration fails from the VPS (403 or timeout), ask MyPhone.ge support to allow the server's IP.
 - Use a paid Gemini API key — an always-on line will hit free-tier daily limits.
 - With `RECORD_CALLS=true`, recordings are saved in `/opt/georgian-ai/recordings/` on the server.
+- Each call is saved as text (caller number, both sides, Tbilisi times) in `transcripts/` next to `docker-compose.yml`. Set `SAVE_TRANSCRIPTS=false` to turn it off; it is personal data, so tell callers if you keep it.
 
 ---
 

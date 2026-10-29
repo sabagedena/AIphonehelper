@@ -24,3 +24,6 @@ voice_samples/
 
 # Call recordings (RECORD_CALLS=true)
 recordings/
+
+# Call transcripts (SAVE_TRANSCRIPTS)
+transcripts/

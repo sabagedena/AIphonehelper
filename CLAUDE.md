@@ -131,6 +131,7 @@ BARGE_IN_MIN_CONFIDENCE=0.80           # Confidence a one-word transcript needs 
 MIN_VOICE_RMS=600.0                    # Foreground voice threshold for spectral isolator
 MUTE_USER_WHILE_BOT_SPEAKS=false       # Barge-in control
 RECORD_CALLS=false                     # true: save each caller's audio to recordings/*.wav for gate tuning
+SAVE_TRANSCRIPTS=true                  # each call as text (caller number, both sides) in transcripts/*.txt
 ```
 
 ---
