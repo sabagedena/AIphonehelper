@@ -84,7 +84,7 @@ git pull && docker compose up -d --build
 | :--- | :--- | :--- |
 | `DEEPGRAM_API_KEY` | Deepgram speech-to-text API key | (Configured) |
 | `GOOGLE_API_KEY` | Google AI Studio Gemini API key | (Configured) |
-| `GEMINI_MODEL` | Gemini LLM model | `gemini-flash-lite-latest` |
+| `GEMINI_MODEL` | Gemini LLM model | `gemini-3.1-flash-lite` |
 | `TTS_PROVIDER` | Speech synthesis provider (`edge` or `elevenlabs`) | `edge` |
 | `EDGE_TTS_VOICE` | Voice: `ka-GE-EkaNeural` (Female) / `ka-GE-GiorgiNeural` (Male) | `ka-GE-EkaNeural` |
 | `EDGE_TTS_RATE` | Speech rate multiplier | `+12%` |

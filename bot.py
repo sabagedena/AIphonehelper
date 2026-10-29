@@ -1,5 +1,6 @@
 import asyncio
 import functools
+import math
 import os
 import random
 import re
@@ -38,7 +39,7 @@ from pipecat.transports.websocket.fastapi import (
 from prompts import (
     INITIAL_GREETING,
     LLM_FAILURE_REPLY,
-    LLM_STILL_WAITING_FILLER,
+    LLM_STILL_WAITING_FILLERS,
     LLM_WAIT_FILLERS,
     build_system_prompt,
 )
@@ -58,21 +59,32 @@ PHONE_SAMPLE_RATE = 8000
 
 # Default model: on the free tier (measured 2026-10-28) gemini-flash-lite-latest gave its first token
 # in ~1s (0.7-2.5s), while gemini-3.1-flash-lite-preview took 2-18s and gemini-3-flash-preview
-# allows only 20 requests/day. On 2026-10-29 it slowed to 4-10 s; FastGoogleLLMService hedges to
-# gemini-3.6-flash (~1.1 s that day, but a free-tier per-minute limit of under ten requests).
-DEFAULT_GEMINI_MODEL = "gemini-flash-lite-latest"
+# allows only 20 requests/day. On the evening of 2026-10-29 flash-lite-latest and gemini-3.5-flash-lite
+# took 3-12 s (most turns of a live call timed out) while gemini-3.1-flash-lite answered in ~1 s.
+# Which model is fast changes by the hour, so FastGoogleLLMService ranks them by measured speed.
+DEFAULT_GEMINI_MODEL = "gemini-3.1-flash-lite"
 
 # Edge TTS pacing when EDGE_TTS_RATE is unset; the cached phone greeting uses the same value
 DEFAULT_EDGE_TTS_RATE = "+12%"
 
-# Fallback chain for failed requests (and the 3 s hedge), fastest first
+# Models a turn may use besides GEMINI_MODEL. Until measured they are tried in this order; the two
+# 20-requests-a-day models come last so hedges don't use their quota up in the first turns of a day.
 _GEMINI_FALLBACK_CHAIN = (
-    "gemini-flash-lite-latest",
-    "gemini-3.6-flash",
     "gemini-3.1-flash-lite",
-    "gemini-3-flash-preview",
     "gemini-flash-lite-latest",
+    "gemini-3.5-flash-lite",
+    "gemini-3.6-flash",
+    "gemini-3-flash-preview",
 )
+
+# Recent time to first spoken text per model on live turns: (seconds, when measured). Each turn
+# starts with the model that has been fastest lately and hedges to the next ones. On the call
+# above, the fixed order tried the one fast model third, 3 s into every turn.
+_model_latency: dict[str, tuple[float, float]] = {}
+# A model not measured yet counts as this. Old measurements fade back to it over about
+# _LATENCY_MEMORY_SECS, so a model that was slow gets another chance once others slow down.
+_UNMEASURED_LATENCY_SECS = 2.0
+_LATENCY_MEMORY_SECS = 900.0
 
 # Models that answered 429 (quota exhausted) are skipped until Google's retryDelay passes, re-probed
 # at least hourly. Free-tier daily quotas are tiny (gemini-3-flash: 20 requests/day), and trying a
@@ -146,6 +158,43 @@ class _SentenceGate:
         return GenerateContentResponse(candidates=[Candidate(content=Content(role="model", parts=[Part(text=" " + tail)]))])
 
 
+def _expected_latency(model: str) -> float:
+    if model not in _model_latency:
+        return _UNMEASURED_LATENCY_SECS
+    secs, at = _model_latency[model]
+    weight = math.exp(-(time.monotonic() - at) / _LATENCY_MEMORY_SECS)
+    return _UNMEASURED_LATENCY_SECS + (secs - _UNMEASURED_LATENCY_SECS) * weight
+
+
+def _note_latency(model: str, secs: float):
+    """Blends one first-text time (a timeout counts as the open timeout) into the model's estimate."""
+    prev = _expected_latency(model) if model in _model_latency else secs
+    _model_latency[model] = (0.5 * prev + 0.5 * secs, time.monotonic())
+
+
+def _rank_models(models: list[str]) -> list[str]:
+    """Distinct models, fastest lately first; ties keep the given order."""
+    return sorted(dict.fromkeys(models), key=_expected_latency)
+
+
+class _PhraseBag:
+    """Hands out phrases in shuffled rounds: none repeats until all were said, and a new round never
+    starts with the one that ended the last, so the caller never hears the same filler twice in a row."""
+
+    def __init__(self, phrases: tuple[str, ...]):
+        self._phrases = phrases
+        self._left: list[str] = []
+        self._last: str | None = None
+
+    def next(self) -> str:
+        if not self._left:
+            self._left = random.sample(self._phrases, len(self._phrases))
+            if len(self._left) > 1 and self._left[-1] == self._last:
+                self._left[0], self._left[-1] = self._left[-1], self._left[0]
+        self._last = self._left.pop()
+        return self._last
+
+
 def _merge_consecutive_user_turns(messages: list) -> list:
     """Joins back-to-back user turns into one utterance.
 
@@ -201,12 +250,11 @@ async def _read_until_content(aiter) -> list[GenerateContentResponse]:
 class FastGoogleLLMService(GoogleLLMService):
     """Low-latency Gemini LLM service with parallel tail-latency hedging."""
 
-    # A warm gemini-flash-lite-latest request usually returns its first token in 0.6-1.0s. When it
-    # hasn't by 1 s, the hedge goes to another model family: on overloaded days (2026-10-29:
-    # flash-lite took 4-10 s and returned 503s, while gemini-3.6-flash answered in ~1.1 s) a second
-    # request to the same model is just as slow. A further same-model request follows at 3 s.
-    _HEDGE_DELAYS_SECS = (1.0, 3.0)
-    _DIVERSE_HEDGE_MODEL = "gemini-3.6-flash"
+    # A warm request to the fastest model usually returns its first token in about 1 s. When it
+    # hasn't by 1 s, and again at 2 s and 4 s, the next model in the ranking is asked too (never the
+    # same model twice: when its servers are overloaded, a second request to them is just as slow).
+    # On the 2026-10-29 call two of three models hung for the full 12 s on most turns.
+    _HEDGE_DELAYS_SECS = (1.0, 2.0, 4.0)
     # Past these with nothing to say, the bot says a short „one moment“ (then „a little longer“)
     # so the line isn't silent; past _GIVE_UP_SECS it apologizes and asks the caller to repeat
     _FILLER_DELAYS_SECS = (2.5, 7.0)
@@ -224,6 +272,8 @@ class FastGoogleLLMService(GoogleLLMService):
         super().__init__(**kwargs)
         self._last_request_at = 0.0
         self._keepwarm_task: asyncio.Task | None = None
+        # One service per call, so the fillers vary across the turns of a call
+        self._fillers = (_PhraseBag(LLM_WAIT_FILLERS), _PhraseBag(LLM_STILL_WAITING_FILLERS))
 
     def create_client(self):
         # genai.Client builds three SSL contexts from the CA bundle (~0.6 s each here), which made
@@ -334,14 +384,16 @@ class FastGoogleLLMService(GoogleLLMService):
 
     async def _stream_response(self, context: LLMContext) -> AsyncIterator[GenerateContentResponse]:
         orig_model = self._settings.model or DEFAULT_GEMINI_MODEL
-        candidates = [orig_model] + list(_GEMINI_FALLBACK_CHAIN)
+        candidates = _rank_models([orig_model] + list(_GEMINI_FALLBACK_CHAIN))
         now = time.monotonic()
         available = [m for m in candidates if _model_cooldown_until.get(m, 0.0) <= now]
         if available:
             candidates = available
         self._log_llm_response(context)
+        logger.debug("Gemini ranking: " + ", ".join(f"{m} {_expected_latency(m):.1f}s" for m in candidates))
 
-        active_tasks: dict[asyncio.Task, str] = {}
+        # task -> (model, when it was sent)
+        active_tasks: dict[asyncio.Task, tuple[str, float]] = {}
         next_idx = 0
         hedges = 0
         last_err: Exception | None = None
@@ -349,11 +401,22 @@ class FastGoogleLLMService(GoogleLLMService):
         started_at = time.monotonic()
         fillers_said = 0
 
-        def launch(model_name: str):
+        def launch_next():
+            nonlocal next_idx
+            model_name = candidates[next_idx]
+            next_idx += 1
             if active_tasks:
                 logger.debug(f"Hedging LLM request with '{model_name}'")
             task = asyncio.create_task(self._open_model_stream(context, model_name))
-            active_tasks[task] = model_name
+            active_tasks[task] = (model_name, time.monotonic())
+
+        def note_unanswered():
+            # Requests about to be cancelled took at least this long; without noting it, a model
+            # that never answers but never fails either would stay first in the ranking
+            now = time.monotonic()
+            for model_name, sent_at in active_tasks.values():
+                if now - sent_at > _expected_latency(model_name):
+                    _note_latency(model_name, now - sent_at)
 
         try:
             while next_idx < len(candidates) or active_tasks:
@@ -361,24 +424,17 @@ class FastGoogleLLMService(GoogleLLMService):
                 # One request at a time, plus a hedge each time a deadline in _HEDGE_DELAYS_SECS
                 # passes with no answer; a failed request is replaced by the next candidate at once.
                 if next_idx < len(candidates) and not active_tasks:
-                    launch(candidates[next_idx])
-                    next_idx += 1
+                    launch_next()
                 elif hedges < len(self._HEDGE_DELAYS_SECS) and elapsed >= self._HEDGE_DELAYS_SECS[hedges]:
-                    # The first hedge goes to another model family: when the first model's servers
-                    # are overloaded, a second request to them is just as slow
-                    other = self._DIVERSE_HEDGE_MODEL if hedges == 0 else None
-                    if other and other not in active_tasks.values() and _model_cooldown_until.get(other, 0.0) <= time.monotonic():
-                        launch(other)
-                    elif next_idx < len(candidates):
-                        launch(candidates[next_idx])
-                        next_idx += 1
+                    if next_idx < len(candidates):
+                        launch_next()
                     hedges += 1
 
                 if fillers_said < len(self._FILLER_DELAYS_SECS) and elapsed >= self._FILLER_DELAYS_SECS[fillers_said]:
                     # Nothing to say yet: a person would say „one moment“ instead of going silent.
                     # Spoken as its own utterance: as reply text, pipecat's sentence aggregator held
                     # it until the answer's first word arrived, so the caller heard silence anyway.
-                    filler = random.choice(LLM_WAIT_FILLERS) if fillers_said == 0 else LLM_STILL_WAITING_FILLER
+                    filler = self._fillers[fillers_said].next()
                     fillers_said += 1
                     logger.debug(f"Gemini slow ({elapsed:.1f}s); saying filler {filler!r}")
                     await self.push_frame(TTSSpeakFrame(filler, append_to_context=False))
@@ -398,20 +454,27 @@ class FastGoogleLLMService(GoogleLLMService):
                 done, _ = await asyncio.wait(active_tasks, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
 
                 for d in done:
-                    model_name = active_tasks.pop(d)
+                    model_name, sent_at = active_tasks.pop(d)
                     try:
                         winner = d.result()
+                        _note_latency(model_name, time.monotonic() - sent_at)
                         break
                     except StopAsyncIteration:
                         return
                     except Exception as e:
                         last_err = e
                         self._note_quota_error(model_name, e)
+                        if getattr(e, "code", None) != 429:
+                            # A timeout or an overload error (503): rank it as slow as a timeout
+                            _note_latency(model_name, self._OPEN_TIMEOUT_SECS)
                         logger.debug(f"Gemini candidate error ({type(e).__name__}): {e}")
+                        if winner is None and next_idx < len(candidates) and active_tasks:
+                            launch_next()
 
                 if winner is not None:
                     break
 
+            note_unanswered()
             if winner is None:
                 # Every model failed. Say so instead of leaving the caller in silence, which on a
                 # call sounds like the line went dead.

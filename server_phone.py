@@ -1187,7 +1187,7 @@ def main():
     print(f"  - Local IP:   {local_ip}")
     print(f"  - Public IP:  {public_ip}")
     print("  - Listening:  Deepgram Nova-3 (Georgian)")
-    print(f"  - Brain:      Google Gemini ({os.getenv('GEMINI_MODEL', 'gemini-flash-lite-latest')})")
+    print(f"  - Brain:      Google Gemini ({os.getenv('GEMINI_MODEL', 'gemini-3.1-flash-lite')})")
     print(f"  - Voice:      Microsoft Edge Neural ({os.getenv('EDGE_TTS_VOICE', 'ka-GE-EkaNeural')})")
     print("=" * 65)
     print("  🚀 სტატუსი: რეგისტრაცია და ხმის მომზადება... (Registering & warming voice...)")

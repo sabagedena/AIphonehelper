@@ -88,6 +88,21 @@ INITIAL_GREETING = "გამარჯობა, მე ვარ ხმოვ�
 # Spoken when no LLM answered at all, so the caller isn't left in silence
 LLM_FAILURE_REPLY = "ბოდიში, ცოტა შემეფერხა. შეგიძლიათ, კიდევ ერთხელ მითხრათ?"
 
-# Spoken once when the LLM is slow to start, before its answer, as a person would while thinking
-LLM_WAIT_FILLERS = ("ერთი წამით.", "ჰმ, ერთი წამით.", "მოიცადეთ, ერთი წამით.")
-LLM_STILL_WAITING_FILLER = "ცოტაც მოითმინეთ, გთხოვთ."
+# Spoken once when the LLM is slow to start, before its answer, as a person would while thinking.
+# On a slow day it plays almost every turn, and one phrase over and over („მოიცადეთ…“ on the first
+# Hetzner calls) sounds like a machine, so each call cycles through all of them without repeats.
+# None of them may promise what the answer might not do (no „გასაგებია“ before „ვერ გავიგე“).
+LLM_WAIT_FILLERS = (
+    "ერთი წამით.",
+    "აბა, ვნახოთ.",
+    "ახლავე გეტყვით.",
+    "კარგი, ერთი წუთით.",
+    "ჰო, ახლავე.",
+    "ცოტა დავფიქრდები.",
+)
+# Spoken if there is still no answer a few seconds later
+LLM_STILL_WAITING_FILLERS = (
+    "ცოტაც მოითმინეთ, გთხოვთ.",
+    "ბოდიში, ცოტა ხანს მოგაცდენთ.",
+    "ცოტაც და გეტყვით.",
+)

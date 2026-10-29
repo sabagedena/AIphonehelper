@@ -49,10 +49,12 @@ This project is a **real-time, sub-second latency conversational Voice AI assist
      │
      ▼
 [LLM Engine] (bot.py)
-  • FastGoogleLLMService (hedge requests at 1.0s to another model family (gemini-3.6-flash) and 3.0s
-    to the next fallback, replies passed on in whole sentences and capped at four, a cut-off
+  • FastGoogleLLMService (models ranked by their measured time to first text on recent turns, the
+    fastest asked first, hedges to the next ranked models at 1.0s and 2.0s, a failed request replaced
+    at once, replies passed on in whole sentences and capped at four, a cut-off
     fragment dropped when max_tokens is hit, back-to-back user turns joined into one before sending,
-    spoken fillers at 2.5s („ერთი წამით“) and 7s (sent to TTS as their own utterances), a spoken
+    spoken fillers at 2.5s („ერთი წამით“, „აბა, ვნახოთ“, …) and 7s (sent to TTS as their own utterances,
+    rotated per call so none repeats back to back), a spoken
     apology if every model fails or nothing arrives in 15s, a keep-warm
     connection; models that return 429 quota errors are skipped until their retry delay passes)
   • OR AnthropicLLMService (Claude Haiku 4.5 with prompt caching)
@@ -103,7 +105,7 @@ DEEPGRAM_MODEL=nova-3
 # --- LLM Brain (Gemini or Anthropic) ---
 LLM_PROVIDER=gemini                    # 'gemini' or 'anthropic'
 GOOGLE_API_KEY=your_google_key
-GEMINI_MODEL=gemini-flash-lite-latest  # ~1s first token on free tier; gemini-3-flash-preview free tier is 20 req/day
+GEMINI_MODEL=gemini-3.1-flash-lite     # tried first until the per-turn speed ranking knows better; gemini-3-flash-preview free tier is 20 req/day
 
 # Anthropic (Optional)
 # LLM_PROVIDER=anthropic
